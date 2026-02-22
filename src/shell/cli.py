@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import logging
 import sys
 
 from shell.__about__ import __version__
@@ -21,6 +22,7 @@ from shell.__about__ import __version__
 
 def build_parser() -> argparse.ArgumentParser:
     """Build and return the argument parser."""
+    # Global flags (before subcommands)
     parser = argparse.ArgumentParser(
         prog="shell",
         description="SHELL — SHELL Highlights Epithelium and Lumen Locations",
@@ -31,6 +33,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="show_version",
         help="Print version and exit.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase logging verbosity (-v for INFO, -vv for DEBUG).",
     )
 
     subparsers = parser.add_subparsers(dest="command")
@@ -52,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-o",
         type=str,
         required=True,
-        help="Path to save the predicted label TIFF.",
+        help="Path to save the predicted label image.",
     )
     infer_p.add_argument(
         "--model-path",
@@ -88,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--device",
         type=str,
         default="auto",
-        help="Device to use (auto, cpu, cuda).",
+        help="Device to use (auto, cpu, cuda, mps).",
     )
 
     # ── infer-omero ───────────────────────────────────────────────────
@@ -136,16 +145,49 @@ def build_parser() -> argparse.ArgumentParser:
         "-o",
         type=str,
         required=True,
-        help="Output path for predicted label TIFF",
+        help="Output path for predicted label image",
     )
     omero_p.add_argument("--save-eho", type=str, default=None)
     omero_p.add_argument("--no-tissue-crop", action="store_true")
-    omero_p.add_argument("--stain-downsample", type=int, default=4)
     omero_p.add_argument(
         "--device",
         type=str,
         default="auto",
-        help="Device to use (auto, cpu, cuda).",
+        help="Device to use (auto, cpu, cuda, mps).",
+    )
+    omero_p.add_argument(
+        "--inference-tile-size",
+        type=int,
+        default=2048,
+        help="Side length (output pixels) of each processing tile. Default 2048.",
+    )
+    omero_p.add_argument(
+        "--num-bg-tiles",
+        type=int,
+        default=4,
+        help="Number of background tiles to fetch for Io estimation. Default 4.",
+    )
+    omero_p.add_argument(
+        "--min-thumb-size",
+        type=int,
+        default=2000,
+        help="Minimum longest edge for the thumbnail level. Default 2000.",
+    )
+    omero_p.add_argument(
+        "--min-tissue-frac",
+        type=float,
+        default=0.01,
+        help="Minimum tissue fraction for a tile to be processed. Default 0.01.",
+    )
+    omero_p.add_argument(
+        "--prefetch-depth",
+        type=int,
+        default=4,
+        help=(
+            "How many tiles the fetch thread may queue ahead of inference. "
+            "Higher values use more memory but tolerate more latency jitter. "
+            "Default 4."
+        ),
     )
 
     return parser
@@ -159,6 +201,20 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Configure logging based on --verbose / -v
+    verbosity = getattr(args, "verbose", 0)
+    if verbosity >= 2:
+        log_level = logging.DEBUG
+    elif verbosity >= 1:
+        log_level = logging.INFO
+    else:
+        log_level = logging.WARNING
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
     # Handle --version as a non-exiting flag so tests calling main(["--version"])
     # don't trigger argparse's SystemExit. Print the package version and exit 0.
@@ -214,9 +270,13 @@ def main(argv: list[str] | None = None) -> int:
             max_dim=args.max_dim,
             group_id=args.group_id,
             save_eho=args.save_eho,
-            stain_downsample=args.stain_downsample,
             no_tissue_crop=args.no_tissue_crop,
             device=args.device,
+            inference_tile_size=args.inference_tile_size,
+            num_bg_tiles=args.num_bg_tiles,
+            min_thumb_size=args.min_thumb_size,
+            min_tissue_frac=args.min_tissue_frac,
+            prefetch_depth=args.prefetch_depth,
         )
         print(f"Saved prediction to {args.output}")
         return 0

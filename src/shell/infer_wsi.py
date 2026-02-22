@@ -24,8 +24,12 @@ import os
 
 import numpy as np
 import openslide
-import pyvips
 
+# shell.inference and shell.model load torch at their module level.
+# pyvips must come *after* them so PyTorch initialises its thread-pool
+# runtime before libvips creates its own.  On macOS the reverse order
+# (pyvips before torch) causes a segfault because both runtimes race to
+# own the same OpenMP/GCD thread infrastructure.
 from shell.inference import run_inference
 from shell.model import CLASS_NAMES, build_model
 from shell.preprocessing import (
@@ -34,6 +38,9 @@ from shell.preprocessing import (
     detect_background,
     estimate_stain_params,
 )
+
+# pyvips intentionally after torch-loading shell imports above (macOS safety)
+import pyvips  # isort: skip
 
 # ---------------------------------------------------------------------------
 # Default parameters
@@ -115,7 +122,12 @@ def infer_wsi(
     import torch
 
     if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
 
     # 1. Preprocess
     eho = preprocess_wsi(
@@ -124,7 +136,7 @@ def infer_wsi(
 
     if save_eho:
         os.makedirs(os.path.dirname(save_eho) or ".", exist_ok=True)
-        pyvips.Image.new_from_array(eho).tiffsave(save_eho)
+        pyvips.Image.new_from_array(eho).write_to_file(save_eho)
 
     # 2. Load model + inference
     model = build_model(model_path, device, model_version=model_version)
@@ -134,6 +146,6 @@ def infer_wsi(
 
     # 3. Save
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    pyvips.Image.new_from_array(label_map).tiffsave(output_path)
+    pyvips.Image.new_from_array(label_map).write_to_file(output_path)
 
     return label_map

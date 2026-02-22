@@ -207,7 +207,7 @@ shell/
 │       ├── preprocessing.py     # Macenko deconvolution & EHO transform
 │       ├── inference.py         # Sliding-window inference
 │       ├── infer_wsi.py         # Local WSI pipeline
-│       ├── infer_omero_wsi.py   # OMERO WSI pipeline (optional dep)
+│       ├── infer_omero_wsi.py   # OMERO WSI pipeline (tiled, pipelined)
 │       ├── weights/             # Bundled model weight files
 │       │   └── model_v1.pth
 │       └── py.typed             # PEP 561 marker

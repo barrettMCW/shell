@@ -8,6 +8,7 @@ Sliding-window inference for whole-slide EHO images.
 from __future__ import annotations
 
 import gc
+import warnings
 
 import numpy as np
 import torch
@@ -58,11 +59,7 @@ def run_inference(
 
     # HWC uint8 → NCHW float32 [0, 1]
     img_t = (
-        torch.from_numpy(eho_image)
-        .permute(2, 0, 1)
-        .unsqueeze(0)
-        .float()
-        .div_(255.0)
+        torch.from_numpy(eho_image).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
     )
     del eho_image
 
@@ -75,7 +72,18 @@ def run_inference(
         img_t = F.pad(img_t, padding, "constant", 0)
 
     amp_device = "cuda" if device.type == "cuda" else "cpu"
-    with torch.inference_mode(), autocast(amp_device):
+    with (
+        torch.inference_mode(),
+        autocast(amp_device),
+        warnings.catch_warnings(),
+    ):
+        # Suppress MONAI's use of deprecated non-tuple sequence indexing
+        # (fixed upstream but not yet released).
+        warnings.filterwarnings(
+            "ignore",
+            message="Using a non-tuple sequence for multidimensional indexing",
+            category=UserWarning,
+        )
         logits = sliding_window_inference(
             img_t,
             roi_size,
