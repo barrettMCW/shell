@@ -203,11 +203,22 @@ def build_parser() -> argparse.ArgumentParser:
     omero_p.add_argument(
         "--prefetch-depth",
         type=int,
-        default=4,
+        default=8,
         help=(
             "How many tiles the fetch thread may queue ahead of inference. "
             "Higher values use more memory but tolerate more latency jitter. "
-            "Default 4."
+            "Default 8."
+        ),
+    )
+    omero_p.add_argument(
+        "--fetch-workers",
+        type=int,
+        default=4,
+        help=(
+            "Number of parallel OMERO connections used to fetch tiles "
+            "concurrently. Each worker opens its own session. Higher "
+            "values overlap more network I/O but consume more server "
+            "sessions. Default 4."
         ),
     )
 
@@ -300,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
             min_thumb_size=args.min_thumb_size,
             min_tissue_frac=args.min_tissue_frac,
             prefetch_depth=args.prefetch_depth,
+            num_fetch_workers=args.fetch_workers,
         )
         print(f"Saved prediction to {args.output}")
         return 0

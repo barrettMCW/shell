@@ -369,8 +369,11 @@ def _fetch_region_rgb_single_store(
 ) -> np.ndarray:
     """Fetch a rectangular RGB region using a **single** RawPixelsStore.
 
-    Reads all three channels in one session, eliminating 2/3 of the
-    store-creation round-trips.
+    Attempts a **bulk** fetch first — one ``getTile`` call per channel
+    for the entire region — which dramatically reduces network
+    round-trips (3 calls instead of ``ceil(W/tile_w) * ceil(H/tile_h)
+    * 3``).  Falls back to native-tile-sized iteration when the server
+    rejects the large request.
 
     Parameters
     ----------
@@ -391,9 +394,6 @@ def _fetch_region_rgb_single_store(
     if region_lw <= 0 or region_lh <= 0:
         return np.full((out_h, out_w, 3), 255, dtype=np.uint8)
 
-    sx = out_w / region_lw
-    sy = out_h / region_lh
-
     rgb = np.zeros((out_h, out_w, 3), dtype=np.uint8)
 
     owns_store = store is None
@@ -403,6 +403,40 @@ def _fetch_region_rgb_single_store(
         store.setResolutionLevel(level)
 
     try:
+        # ── Fast path: bulk fetch (3 calls instead of N*3) ────────────
+        try:
+            for b, c_idx in enumerate(channel_ids):
+                raw = store.getTile(
+                    0,
+                    c_idx,
+                    0,
+                    lx0,
+                    ly0,
+                    region_lw,
+                    region_lh,
+                )
+                arr = (
+                    np.frombuffer(raw, dtype=dtype).reshape(region_lh, region_lw).copy()
+                )
+                arr_u8 = _to_uint8(arr)
+                del arr
+                if arr_u8.shape[0] != out_h or arr_u8.shape[1] != out_w:
+                    arr_u8 = _resize_tile(arr_u8, out_h, out_w)
+                rgb[: arr_u8.shape[0], : arr_u8.shape[1], b] = arr_u8[:out_h, :out_w]
+                del arr_u8
+            return rgb
+        except Exception:
+            logger.debug(
+                "Bulk fetch failed for region %dx%d; falling back to tiled",
+                region_lw,
+                region_lh,
+            )
+            rgb[:] = 0
+
+        # ── Slow path: iterate over native tiles ─────────────────────
+        sx = out_w / region_lw
+        sy = out_h / region_lh
+
         start_ty = (ly0 // tile_h) * tile_h
         start_tx = (lx0 // tile_w) * tile_w
 
@@ -778,16 +812,57 @@ def _build_tile_grid(
     return schedule, num_rows, num_cols, tiles_total
 
 
+def _precompute_tile_info(
+    tile_schedule: list[tuple[int, int, int, int, int, int, int, int]],
+    num_rows: int,
+    num_cols: int,
+    tile_overlap: int,
+) -> list[tuple[int, int, int, int, int, int, int, int, int, int]]:
+    """Precompute full keep regions (including keep_h / keep_w).
+
+    Returns entries of
+    ``(ri, ci, oy0, ox0, oh, ow, keep_y0, keep_x0, keep_h, keep_w)``.
+    """
+    result: list[tuple[int, int, int, int, int, int, int, int, int, int]] = []
+    for ri, ci, oy0, ox0, oh, ow, keep_y0, keep_x0 in tile_schedule:
+        bottom_trim = (
+            (tile_overlap - tile_overlap // 2)
+            if tile_overlap > 0 and ri < num_rows - 1
+            else 0
+        )
+        right_trim = (
+            (tile_overlap - tile_overlap // 2)
+            if tile_overlap > 0 and ci < num_cols - 1
+            else 0
+        )
+        if oh > 1:
+            bottom_trim = min(bottom_trim, oh - keep_y0 - 1)
+        else:
+            bottom_trim = 0
+        if ow > 1:
+            right_trim = min(right_trim, ow - keep_x0 - 1)
+        else:
+            right_trim = 0
+        keep_h = oh - keep_y0 - bottom_trim
+        keep_w = ow - keep_x0 - right_trim
+        result.append((ri, ci, oy0, ox0, oh, ow, keep_y0, keep_x0, keep_h, keep_w))
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Producer thread — fetch + EHO (no torch)
 # ---------------------------------------------------------------------------
 
 
-def _tile_fetch_producer(
-    conn: BlitzGateway,
-    tile_schedule: list[tuple[int, int, int, int, int, int, int, int]],
-    num_rows: int,
-    num_cols: int,
+def _fetch_worker(
+    worker_id: int,
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    work_queue: queue.Queue[Any],
+    result_queue: queue.Queue[Any],
+    stop_event: threading.Event,
     pixels_id: int,
     best_level: int,
     channel_ids: list[int],
@@ -799,187 +874,174 @@ def _tile_fetch_producer(
     sx: float,
     sy: float,
     stain_params: dict[str, Any],
-    tile_queue: queue.Queue[Any],
-    tile_overlap: int,
 ) -> None:
-    """Fetch tiles from OMERO and apply EHO, enqueuing results for inference.
+    """Single fetch worker — owns its own OMERO connection.
 
-    When *tile_overlap* > 0 the producer caches EHO border strips so that
-    overlapping pixel data is fetched from OMERO **exactly once**.  For
-    each tile in raster order the top and left overlap come from cached
-    strips of previously processed neighbours; only the remaining
-    rectangle is fetched over the network.
+    Pulls tile descriptors from *work_queue*, fetches pixel data from
+    OMERO (using the bulk-fetch fast-path when possible), applies EHO
+    normalisation, and places the result on *result_queue*.
 
-    A single ``RawPixelsStore`` is kept open for the entire run to avoid
-    per-tile session overhead.
-
-    All OMERO proxy calls happen exclusively in this thread so they are
-    naturally serialised and Ice WSS stays happy.  EHO (pure numpy) is
-    applied here too — since numpy releases the GIL, this work overlaps
-    with torch inference running in the main thread.
-
-    The bounded queue applies back-pressure when inference falls behind.
-
-    On completion a sentinel is placed on the queue.  If an exception
-    occurs it is placed on the queue instead so the consumer can re-raise.
+    The bounded *result_queue* provides back-pressure: if inference falls
+    behind, workers block on ``put`` until space is available.
     """
     from shell.preprocessing import apply_eho_chunked
 
-    # EHO strip caches — keyed by (row, col).
-    # right_strips:  last  ``tile_overlap`` columns  → used by (r, c+1)
-    # bottom_strips: last  ``tile_overlap`` rows     → used by (r+1, c)
-    right_strips: dict[tuple[int, int], np.ndarray] = {}
-    bottom_strips: dict[tuple[int, int], np.ndarray] = {}
-
-    # Track which (row, col) pairs are in the schedule for cache clean-up.
-    scheduled_set = {(r, c) for r, c, *_ in tile_schedule}
-
+    conn = None
     store = None
     try:
-        # Open a persistent RawPixelsStore for the entire run.
+        conn = create_omero_connection(host, port, username, password)
         store = conn.c.sf.createRawPixelsStore()
         store.setPixelsId(pixels_id, False)
         store.setResolutionLevel(best_level)
 
-        n = len(tile_schedule)
-        prev_row = -1
+        while not stop_event.is_set():
+            try:
+                item = work_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
 
-        for tile_idx, (ri, ci, oy0, ox0, oh, ow, keep_y0, keep_x0) in enumerate(
-            tile_schedule
-        ):
-            # ── Determine which overlap strips are available in cache ──
-            has_top = tile_overlap > 0 and ri > 0 and (ri - 1, ci) in bottom_strips
-            has_left = tile_overlap > 0 and ci > 0 and (ri, ci - 1) in right_strips
+            if item is _SENTINEL:
+                # Put it back so other workers also see it and exit.
+                work_queue.put(_SENTINEL)
+                break
 
-            # Validate cached shapes match expectations.
-            if has_top:
-                bs = bottom_strips[(ri - 1, ci)]
-                if bs.shape[0] != tile_overlap or bs.shape[1] != ow:
-                    has_top = False  # shape mismatch (edge tile) — fetch instead
-            if has_left:
-                rs = right_strips[(ri, ci - 1)]
-                if rs.shape[0] != oh or rs.shape[1] != tile_overlap:
-                    has_left = False
+            (
+                _ri,
+                _ci,
+                oy0,
+                ox0,
+                oh,
+                ow,
+                keep_y0,
+                keep_x0,
+                keep_h,
+                keep_w,
+            ) = item
 
-            new_y0 = tile_overlap if has_top else 0
-            new_x0 = tile_overlap if has_left else 0
-            new_h = oh - new_y0
-            new_w = ow - new_x0
+            lx0 = int(round(ox0 / sx))
+            ly0 = int(round(oy0 / sy))
+            lx1 = min(best_lsz_x, int(round((ox0 + ow) / sx)))
+            ly1 = min(best_lsz_y, int(round((oy0 + oh) / sy)))
 
-            # ── Fetch only the NEW rectangle from OMERO ───────────────
-            if new_h > 0 and new_w > 0:
-                fetch_oy = oy0 + new_y0
-                fetch_ox = ox0 + new_x0
-                lx0 = int(round(fetch_ox / sx))
-                ly0 = int(round(fetch_oy / sy))
-                lx1 = min(best_lsz_x, int(round((fetch_ox + new_w) / sx)))
-                ly1 = min(best_lsz_y, int(round((fetch_oy + new_h) / sy)))
-
-                new_rgb = _fetch_region_rgb(
-                    conn,
-                    pixels_id,
-                    best_level,
-                    channel_ids,
-                    best_lsz_x,
-                    best_lsz_y,
-                    tile_w,
-                    tile_h,
-                    dtype,
-                    lx0=lx0,
-                    ly0=ly0,
-                    lx1=lx1,
-                    ly1=ly1,
-                    out_w=new_w,
-                    out_h=new_h,
-                    store=store,
-                )
-                new_eho = apply_eho_chunked(new_rgb, **stain_params)
-                del new_rgb
-            else:
-                new_eho = None
-
-            # ── Assemble the full tile EHO from cache + new data ──────
-            tile_eho = np.full((oh, ow, 3), 255, dtype=np.uint8)
-
-            if has_top:
-                tile_eho[0:tile_overlap, :, :] = bottom_strips[(ri - 1, ci)]
-            if has_left:
-                tile_eho[:, 0:tile_overlap, :] = right_strips[(ri, ci - 1)]
-            if new_eho is not None:
-                tile_eho[new_y0 : new_y0 + new_h, new_x0 : new_x0 + new_w, :] = new_eho
-                del new_eho
-
-            # ── Cache strips for future neighbours ────────────────────
-            if tile_overlap > 0:
-                # Right strip → for (ri, ci+1)
-                if ci + 1 < num_cols and (ri, ci + 1) in scheduled_set:
-                    right_strips[(ri, ci)] = tile_eho[:, -tile_overlap:, :].copy()
-                # Bottom strip → for (ri+1, ci)
-                if ri + 1 < num_rows and (ri + 1, ci) in scheduled_set:
-                    bottom_strips[(ri, ci)] = tile_eho[-tile_overlap:, :, :].copy()
-
-            # ── Evict stale cache from previous row ───────────────────
-            if ri > prev_row:
-                for key in list(bottom_strips):
-                    if key[0] < ri - 1:
-                        del bottom_strips[key]
-                for key in list(right_strips):
-                    if key[0] < ri:
-                        del right_strips[key]
-                prev_row = ri
-
-            # Evict left-strip we just consumed (no longer needed).
-            right_strips.pop((ri, ci - 1), None)
-
-            # ── Compute keep region dims ──────────────────────────────
-            # Bottom / right trim depend on whether a later neighbour
-            # exists in the grid.
-            bottom_trim = (
-                (tile_overlap - tile_overlap // 2)
-                if tile_overlap > 0 and ri < num_rows - 1
-                else 0
+            rgb = _fetch_region_rgb_single_store(
+                conn,
+                pixels_id,
+                best_level,
+                channel_ids,
+                best_lsz_x,
+                best_lsz_y,
+                tile_w,
+                tile_h,
+                dtype,
+                lx0=lx0,
+                ly0=ly0,
+                lx1=lx1,
+                ly1=ly1,
+                out_w=ow,
+                out_h=oh,
+                store=store,
             )
-            right_trim = (
-                (tile_overlap - tile_overlap // 2)
-                if tile_overlap > 0 and ci < num_cols - 1
-                else 0
-            )
-            # Clamp trims so the keep region is never empty.
-            if oh > 1:
-                bottom_trim = min(bottom_trim, oh - keep_y0 - 1)
-            else:
-                bottom_trim = 0
-            if ow > 1:
-                right_trim = min(right_trim, ow - keep_x0 - 1)
-            else:
-                right_trim = 0
 
-            keep_h = oh - keep_y0 - bottom_trim
-            keep_w = ow - keep_x0 - right_trim
+            tile_eho = apply_eho_chunked(rgb, **stain_params)
+            del rgb
 
-            tile_queue.put(
+            result_queue.put(
                 (oy0, ox0, oh, ow, keep_y0, keep_x0, keep_h, keep_w, tile_eho)
             )
-
-            done = tile_idx + 1
-            if done % 20 == 0 or done == n:
-                logger.info(
-                    "Prefetch: %d / %d tiles (%.0f%%)",
-                    done,
-                    n,
-                    done / n * 100,
-                )
-
-        tile_queue.put(_SENTINEL)
     except Exception as exc:
-        logger.exception("Fetch thread encountered an error")
-        tile_queue.put(exc)
+        logger.exception("Fetch worker %d encountered an error", worker_id)
+        result_queue.put(exc)
     finally:
         if store is not None:
             try:
                 store.close()
             except Exception:
                 pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _parallel_fetch_coordinator(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    tile_infos: list[tuple[int, int, int, int, int, int, int, int, int, int]],
+    result_queue: queue.Queue[Any],
+    pixels_id: int,
+    best_level: int,
+    channel_ids: list[int],
+    best_lsz_x: int,
+    best_lsz_y: int,
+    tile_w: int,
+    tile_h: int,
+    dtype: Any,
+    sx: float,
+    sy: float,
+    stain_params: dict[str, Any],
+    num_workers: int,
+) -> None:
+    """Start *num_workers* fetch threads, each with its own OMERO session.
+
+    All tile descriptors are placed on a shared work queue.  Workers pull
+    tiles, fetch pixels, apply EHO, and place results on *result_queue*.
+    When the work queue is exhausted a ``_SENTINEL`` is placed on
+    *result_queue* so the consumer knows all tiles have been produced.
+    """
+    work_queue: queue.Queue[Any] = queue.Queue()
+    stop_event = threading.Event()
+
+    for info in tile_infos:
+        work_queue.put(info)
+    # Single poison pill — each worker that sees it puts it back.
+    work_queue.put(_SENTINEL)
+
+    n_tiles = len(tile_infos)
+    logger.info(
+        "Starting %d fetch worker(s) for %d tiles …",
+        num_workers,
+        n_tiles,
+    )
+
+    workers: list[threading.Thread] = []
+    for i in range(num_workers):
+        t = threading.Thread(
+            target=_fetch_worker,
+            kwargs={
+                "worker_id": i,
+                "host": host,
+                "port": port,
+                "username": username,
+                "password": password,
+                "work_queue": work_queue,
+                "result_queue": result_queue,
+                "stop_event": stop_event,
+                "pixels_id": pixels_id,
+                "best_level": best_level,
+                "channel_ids": channel_ids,
+                "best_lsz_x": best_lsz_x,
+                "best_lsz_y": best_lsz_y,
+                "tile_w": tile_w,
+                "tile_h": tile_h,
+                "dtype": dtype,
+                "sx": sx,
+                "sy": sy,
+                "stain_params": stain_params,
+            },
+            name=f"omero-fetch-{i}",
+            daemon=True,
+        )
+        t.start()
+        workers.append(t)
+
+    for t in workers:
+        t.join()
+
+    result_queue.put(_SENTINEL)
+    logger.info("All fetch workers finished.")
 
 
 # ---------------------------------------------------------------------------
@@ -1045,7 +1107,8 @@ def infer_omero_wsi(
     num_bg_tiles: int = 4,
     min_thumb_size: int = 2000,
     min_tissue_frac: float = 0.01,
-    prefetch_depth: int = 4,
+    prefetch_depth: int = 8,
+    num_fetch_workers: int = 4,
 ) -> np.ndarray:
     """Tile-based OMERO inference pipeline.
 
@@ -1115,6 +1178,11 @@ def infer_omero_wsi(
     prefetch_depth : int
         How many tiles the fetch thread may queue ahead of inference.
         Higher values use more memory but tolerate more latency jitter.
+    num_fetch_workers : int
+        Number of parallel OMERO connections used to fetch tiles
+        concurrently.  Each worker opens its own session.  Higher
+        values overlap more network I/O but consume more server
+        sessions.  Default 4.
 
     Returns
     -------
@@ -1379,6 +1447,10 @@ def infer_omero_wsi(
         # ------------------------------------------------------------------
         return _run_pipeline(
             conn=conn,
+            host=host,
+            port=port,
+            username=username,
+            password=password,
             tile_schedule=tile_schedule,
             num_rows=num_rows,
             num_cols=num_cols,
@@ -1404,6 +1476,7 @@ def infer_omero_wsi(
             output_path=output_path,
             tile_overlap=tile_overlap,
             sw_overlap=sw_overlap,
+            num_fetch_workers=num_fetch_workers,
         )
 
     except Exception:
@@ -1422,6 +1495,10 @@ def infer_omero_wsi(
 def _run_pipeline(
     *,
     conn: BlitzGateway,
+    host: str,
+    port: int,
+    username: str,
+    password: str,
     tile_schedule: list[tuple[int, int, int, int, int, int, int, int]],
     num_rows: int,
     num_cols: int,
@@ -1447,13 +1524,18 @@ def _run_pipeline(
     output_path: str,
     tile_overlap: int,
     sw_overlap: float,
+    num_fetch_workers: int = 4,
 ) -> np.ndarray:
-    """Producer/consumer pipeline: fetch+EHO in thread, inference in main.
+    """Producer/consumer pipeline: parallel fetch+EHO → inference in main.
 
-    The fetch thread handles all OMERO I/O, EHO colour normalisation, and
-    overlap-strip caching (numpy — releases GIL).  The main thread handles
-    only torch inference.  The two threads never share Ice proxies or
-    torch objects, so they are safe on all platforms.
+    *num_fetch_workers* threads each open their own OMERO connection and
+    pull tiles from a shared work queue.  The main thread consumes
+    ready-to-infer EHO tiles and runs model inference.
+
+    Using multiple connections overlaps network round-trip latency across
+    tiles, and the bulk-fetch optimisation in
+    :func:`_fetch_region_rgb_single_store` reduces per-tile round-trips
+    from ``O(N_subtiles * 3)`` to just 3 (one per channel).
 
     Each queued item contains the tile EHO **and** the keep region that
     the consumer should write to the output canvas, implementing the
@@ -1461,13 +1543,23 @@ def _run_pipeline(
     """
     tile_queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, prefetch_depth))
 
+    # Precompute full keep-region info so workers are self-contained.
+    tile_infos = _precompute_tile_info(
+        tile_schedule,
+        num_rows,
+        num_cols,
+        tile_overlap,
+    )
+
     fetch_thread = threading.Thread(
-        target=_tile_fetch_producer,
+        target=_parallel_fetch_coordinator,
         kwargs={
-            "conn": conn,
-            "tile_schedule": tile_schedule,
-            "num_rows": num_rows,
-            "num_cols": num_cols,
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "tile_infos": tile_infos,
+            "result_queue": tile_queue,
             "pixels_id": pixels_id,
             "best_level": best_level,
             "channel_ids": channel_ids,
@@ -1479,10 +1571,9 @@ def _run_pipeline(
             "sx": sx,
             "sy": sy,
             "stain_params": stain_params,
-            "tile_queue": tile_queue,
-            "tile_overlap": tile_overlap,
+            "num_workers": num_fetch_workers,
         },
-        name="omero-tile-fetch",
+        name="omero-fetch-coordinator",
         daemon=True,
     )
     fetch_thread.start()
