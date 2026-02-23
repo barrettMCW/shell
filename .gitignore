@@ -73,6 +73,9 @@ dmypy.json
 # Misc
 *.bak
 *.tmp
+*.png
+*.csv
+*.json
 
 # Data / model weights (too large for git)
 *.pth
