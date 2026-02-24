@@ -58,8 +58,9 @@ requires = ["hatch-pip-compile"]
 
 [tool.hatch.envs.default]
 type = "pip-compile"
-pip-compile-hashes = true
-pip-compile-args = ["--allow-unsafe"]
+pip-compile-resolver = "uv"
+pip-compile-hashes = false
+pip-compile-args = ["--allow-unsafe", "--universal"]
 dependencies = ["setuptools==82.0.0"]
 
 [tool.hatch.envs.default.scripts]

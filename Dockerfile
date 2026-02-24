@@ -22,7 +22,7 @@ COPY src/ src/
 RUN chown -R vscode:vscode /app
 
 FROM base AS hatch
-RUN pip3 install --no-cache-dir hatch
+RUN pip3 install --no-cache-dir hatch uv
 ENV HATCH_ENV=default
 ENTRYPOINT ["hatch", "run"]
 

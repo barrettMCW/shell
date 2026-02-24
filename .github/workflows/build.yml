@@ -14,7 +14,9 @@ jobs:
       - name: Build Docker image
         run: docker build --target hatch -t shell:hatch .
       - name: Build wheel with hatch
-        run: docker run --rm -v "${{ github.workspace }}:/app" shell:hatch build
+        run: docker run --rm --entrypoint hatch -v "${{ github.workspace }}:/app" shell:hatch build
+      - name: Fix dist permissions
+        run: chmod -R 777 dist/
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
