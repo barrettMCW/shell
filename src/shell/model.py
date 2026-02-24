@@ -22,8 +22,11 @@ from __future__ import annotations
 import importlib.resources
 from pathlib import Path
 
+import PIL.Image
 import torch
 from monai.networks.nets import SegResNetVAE
+
+PIL.Image.MAX_IMAGE_PIXELS = None  # disable DecompressionBombError for large WSIs
 
 # ---------------------------------------------------------------------------
 # Default hyper-parameters (keep in sync with train.ipynb)
@@ -86,7 +89,7 @@ def _resolve_bundled_weights(version: str | None = None) -> Path:
 def _patch_segresntvae_forward() -> None:
     """Monkey-patch ``SegResNetVAE.forward`` to skip VAE loss at eval time."""
 
-    def _forward(self, x):  # noqa: ANN001, ANN202
+    def _forward(self, x):
         x_enc, down_x = self.encode(x)
         down_x.reverse()
         x_dec = self.decode(x_enc, down_x)

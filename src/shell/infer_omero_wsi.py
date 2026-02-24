@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 # Optional OMERO dependency gate
 # ---------------------------------------------------------------------------
 try:
-    from omero.gateway import BlitzGateway as _BlitzGateway  # noqa: F811
+    from omero.gateway import BlitzGateway as _BlitzGateway
     from omero.model import enums as omero_enums
 
     PIXEL_TYPES: dict[str, type] = {
@@ -142,7 +142,7 @@ def create_omero_connection(
         A connected gateway instance.
     """
     _require_omero()
-    from omero.gateway import BlitzGateway as _BG  # noqa: F811
+    from omero.gateway import BlitzGateway as _BG
 
     parsed = urlparse(host)
 
@@ -319,8 +319,8 @@ def _fetch_channel_tiles(
             rh = ry1 - ry0
             if rh <= 0:
                 continue
-            oy0 = int(round((ry0 - crop_ly0) * sy))
-            oy1 = int(round((ry1 - crop_ly0) * sy))
+            oy0 = round((ry0 - crop_ly0) * sy)
+            oy1 = round((ry1 - crop_ly0) * sy)
             oh = max(1, oy1 - oy0)
 
             for tx in range(start_tx, crop_lx1, tile_w):
@@ -329,8 +329,8 @@ def _fetch_channel_tiles(
                 rw = rx1 - rx0
                 if rw <= 0:
                     continue
-                ox0 = int(round((rx0 - crop_lx0) * sx))
-                ox1 = int(round((rx1 - crop_lx0) * sx))
+                ox0 = round((rx0 - crop_lx0) * sx)
+                ox1 = round((rx1 - crop_lx0) * sx)
                 ow = max(1, ox1 - ox0)
 
                 raw = store.getTile(0, c_idx, 0, rx0, ry0, rw, rh)
@@ -446,8 +446,8 @@ def _fetch_region_rgb_single_store(
             rh = ry1 - ry0
             if rh <= 0:
                 continue
-            oy0 = int(round((ry0 - ly0) * sy))
-            oy1 = int(round((ry1 - ly0) * sy))
+            oy0 = round((ry0 - ly0) * sy)
+            oy1 = round((ry1 - ly0) * sy)
             oh = max(1, oy1 - oy0)
 
             for tx in range(start_tx, lx1, tile_w):
@@ -456,8 +456,8 @@ def _fetch_region_rgb_single_store(
                 rw = rx1 - rx0
                 if rw <= 0:
                     continue
-                ox0 = int(round((rx0 - lx0) * sx))
-                ox1 = int(round((rx1 - lx0) * sx))
+                ox0 = round((rx0 - lx0) * sx)
+                ox1 = round((rx1 - lx0) * sx)
                 ow = max(1, ox1 - ox0)
 
                 for b, c_idx in enumerate(channel_ids):
@@ -918,10 +918,10 @@ def _fetch_worker(
                 keep_w,
             ) = item
 
-            lx0 = int(round(ox0 / sx))
-            ly0 = int(round(oy0 / sy))
-            lx1 = min(best_lsz_x, int(round((ox0 + ow) / sx)))
-            ly1 = min(best_lsz_y, int(round((oy0 + oh) / sy)))
+            lx0 = round(ox0 / sx)
+            ly0 = round(oy0 / sy)
+            lx1 = min(best_lsz_x, round((ox0 + ow) / sx))
+            ly1 = min(best_lsz_y, round((oy0 + oh) / sy))
 
             rgb = _fetch_region_rgb_single_store(
                 conn,
@@ -1167,7 +1167,7 @@ def infer_omero_wsi(
         disable.  Default 128.
     sw_overlap : float
         Fractional overlap for the MONAI sliding-window inference *within*
-        each tile (0–1).  Higher values improve patch-boundary quality at
+        each tile (0-1).  Higher values improve patch-boundary quality at
         the cost of more forward passes.  Default 0.25.
     num_bg_tiles : int
         Number of background tiles to fetch for *Io* estimation.
@@ -1264,13 +1264,13 @@ def infer_omero_wsi(
 
         sx = best_lmpp_x / target_mpp
         sy = best_lmpp_y / target_mpp
-        out_w = max(1, int(round(best_lsz_x * sx)))
-        out_h = max(1, int(round(best_lsz_y * sy)))
+        out_w = max(1, round(best_lsz_x * sx))
+        out_h = max(1, round(best_lsz_y * sy))
 
         if max_dim is not None and (out_w > max_dim or out_h > max_dim):
             clamp = min(max_dim / out_w, max_dim / out_h)
-            out_w = max(1, int(round(out_w * clamp)))
-            out_h = max(1, int(round(out_h * clamp)))
+            out_w = max(1, round(out_w * clamp))
+            out_h = max(1, round(out_h * clamp))
             sx *= clamp
             sy *= clamp
 
@@ -1345,10 +1345,10 @@ def infer_omero_wsi(
             )
             bg_pixels: list[np.ndarray] = []
             for oy0_bg, ox0_bg, oh_bg, ow_bg in bg_tile_coords:
-                lx0_bg = int(round(ox0_bg / sx))
-                ly0_bg = int(round(oy0_bg / sy))
-                lx1_bg = min(best_lsz_x, int(round((ox0_bg + ow_bg) / sx)))
-                ly1_bg = min(best_lsz_y, int(round((oy0_bg + oh_bg) / sy)))
+                lx0_bg = round(ox0_bg / sx)
+                ly0_bg = round(oy0_bg / sy)
+                lx1_bg = min(best_lsz_x, round((ox0_bg + ow_bg) / sx))
+                ly1_bg = min(best_lsz_y, round((oy0_bg + oh_bg) / sy))
                 tile_rgb = _fetch_region_rgb(
                     conn,
                     pixels_id,

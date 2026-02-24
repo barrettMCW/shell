@@ -45,7 +45,8 @@ import statistics
 import subprocess
 import sys
 import time
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from collections.abc import Iterable
+from typing import Any
 
 try:
     import psutil
@@ -57,7 +58,7 @@ except Exception:  # pragma: no cover - runtime environment may lack psutil
 # ---------------------------------------------------------------------------
 
 
-def _get_macos_static_gpu_info() -> Optional[Dict[str, Any]]:
+def _get_macos_static_gpu_info() -> dict[str, Any] | None:
     """Get static GPU info on macOS without sudo via system_profiler.
 
     Returns a dict with keys (model, vram_mib) or None if not available.
@@ -77,7 +78,7 @@ def _get_macos_static_gpu_info() -> Optional[Dict[str, Any]]:
         d0 = displays[0]
         model = d0.get("sppci_model") or d0.get("_name") or d0.get("sppci_vendor")
         vram = d0.get("spdisplays_vram") or d0.get("spdisplays_vram_shared")
-        vram_mib: Optional[int] = None
+        vram_mib: int | None = None
         if isinstance(vram, str):
             parts = vram.split()
             try:
@@ -94,7 +95,7 @@ def _get_macos_static_gpu_info() -> Optional[Dict[str, Any]]:
         return None
 
 
-def _process_uses_metal(pid: int) -> Optional[bool]:
+def _process_uses_metal(pid: int) -> bool | None:
     """Heuristic: check whether process has opened Metal framework files (no sudo).
 
     Uses `lsof -p PID` (no sudo typically) and looks for substrings like
@@ -124,7 +125,7 @@ def now_s() -> float:
     return time.perf_counter()
 
 
-def safe_run_nvidia_smi() -> Optional[str]:
+def safe_run_nvidia_smi() -> str | None:
     """Return raw nvidia-smi output line (CSV) or None if not available.
 
     The output format is:
@@ -152,7 +153,7 @@ def safe_run_nvidia_smi() -> Optional[str]:
 
 def parse_nvidia_smi(
     csv_line: str,
-) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+) -> tuple[float | None, float | None, float | None]:
     """Parse a single nvidia-smi CSV line (first GPU) to floats.
 
     Returns (gpu_util_pct, gpu_mem_used_mib, gpu_mem_total_mib).
@@ -172,9 +173,9 @@ def parse_nvidia_smi(
         return None, None, None
 
 
-def aggregate_stats(values: Iterable[float]) -> Dict[str, Optional[float]]:
+def aggregate_stats(values: Iterable[float]) -> dict[str, float | None]:
     """Compute min/avg/median/max for a non-empty sequence; handle empty."""
-    vals = list(v for v in values if v is not None)
+    vals = [v for v in values if v is not None]
     if not vals:
         return {"min": None, "avg": None, "median": None, "max": None}
     return {
@@ -191,15 +192,15 @@ def aggregate_stats(values: Iterable[float]) -> Dict[str, Optional[float]]:
 
 
 def benchmark_command(
-    cmd: List[str],
+    cmd: list[str],
     *,
     sampling_interval: float = 0.5,
-    csv_path: Optional[str] = None,
-    json_path: Optional[str] = None,
-    timeout: Optional[float] = None,
+    csv_path: str | None = None,
+    json_path: str | None = None,
+    timeout: float | None = None,
     capture_stdout: bool = False,
     capture_stderr: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Run `cmd` (list[str]) and sample resource usage until completion.
 
     Parameters
@@ -245,7 +246,7 @@ def benchmark_command(
     proc_ps = psutil.Process(proc.pid)
 
     # Collect samples as list of dicts
-    samples: List[Dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
     start_time = now_s()
     last_cpu_times = None  # type: Optional[float]
     last_sample_time = start_time
@@ -276,7 +277,7 @@ def benchmark_command(
                     if last_sample_time is not None
                     else sampling_interval
                 )
-                # process CPU percent computed as delta CPU time / wall time / num_cpus * 100
+                # process CPU %: delta CPU time / wall time / num_cpus * 100
                 try:
                     cpu_count = psutil.cpu_count(logical=True) or 1
                 except Exception:
@@ -426,7 +427,7 @@ def benchmark_command(
                 break
 
             # Sleep until next sample (but wake up early if process exits)
-            # Use small sleeps to be responsive to termination while maintaining approximate interval.
+            # Use small sleeps to stay responsive to termination.
             slept = 0.0
             while slept < sampling_interval:
                 if proc.poll() is not None:
@@ -506,7 +507,7 @@ def benchmark_command(
         "timed_out": bool(timed_out),
     }
 
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         "timing": {
             "wall_seconds": float(wall_seconds),
             "exit_code": exit_code,
@@ -532,12 +533,13 @@ def benchmark_command(
     print(f"  wall_seconds: {wall_seconds:.3f}")
     print(f"  exit_code: {exit_code}  timed_out: {timed_out}")
 
-    def fmt_stats(label: str, data: Dict[str, Optional[float]], unit: str = "") -> None:
+    def fmt_stats(label: str, data: dict[str, float | None], unit: str = "") -> None:
         if data["avg"] is None:
             print(f"  {label}: (no data)")
         else:
             print(
-                f"  {label}: avg={data['avg']:.3f}{unit} med={data['median']:.3f}{unit} "
+                f"  {label}: avg={data['avg']:.3f}{unit}"
+                f" med={data['median']:.3f}{unit} "
                 f"min={data['min']:.3f}{unit} max={data['max']:.3f}{unit}"
             )
 
@@ -555,10 +557,10 @@ def benchmark_command(
 # ---------------------------------------------------------------------------
 
 
-def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="shell-benchmark",
-        description="Run a command while sampling CPU / RAM / GPU usage and summarise results.",
+        description="Run a command while sampling CPU / RAM / GPU usage.",
     )
     p.add_argument(
         "--interval", type=float, default=0.5, help="Sampling interval (seconds)."
@@ -589,7 +591,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if not args.cmd:
         print("No command provided. See --help.", file=sys.stderr)
@@ -612,7 +614,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"  writing JSON -> {args.json}")
 
     try:
-        res = benchmark_command(
+        benchmark_command(
             cmd,
             sampling_interval=args.interval,
             csv_path=args.csv,

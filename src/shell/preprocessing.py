@@ -308,7 +308,7 @@ def apply_eho_chunked(
         chunk = np.clip(image_np[r0:r1].astype(np.float32), 1.0, Io_f)
         chunk /= Io_f
         np.log10(chunk, out=chunk)
-        chunk *= -1.0  # OD = −log10(I / Io)
+        chunk *= -1.0  # OD = -log10(I / Io)
 
         # Stain concentrations
         e_conc = np.einsum("ijk,k->ij", chunk, e_vec)

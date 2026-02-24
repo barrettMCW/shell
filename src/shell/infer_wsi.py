@@ -31,10 +31,9 @@ import openslide
 # (pyvips before torch) causes a segfault because both runtimes race to
 # own the same OpenMP/GCD thread infrastructure.
 from shell.inference import run_inference
-from shell.model import CLASS_NAMES, build_model
+from shell.model import build_model
 from shell.preprocessing import (
     apply_eho_chunked,
-    compute_background_intensity,
     detect_background,
     estimate_stain_params,
 )
