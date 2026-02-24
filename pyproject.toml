@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "shell"
+name = "lavlab-shell"
 dynamic = ["version"]
 description = "SHELL Highlights Epithelium and Lumen Locations — whole-slide H&E segmentation"
 readme = "README.md"
@@ -40,6 +40,7 @@ omero = ["omero-py", "zeroc-ice"]
 
 [project.scripts]
 shell = "shell.cli:main"
+lavlab-shell = "shell.cli:main"
 
 [project.urls]
 Documentation = "https://github.com/laviolette-lab/shell#readme"
