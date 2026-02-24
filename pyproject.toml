@@ -59,19 +59,20 @@ requires = ["hatch-pip-compile"]
 [tool.hatch.envs.default]
 type = "pip-compile"
 pip-compile-hashes = true
+pip-compile-args = ["--allow-unsafe"]
 dependencies = ["setuptools==82.0.0"]
 
 [tool.hatch.envs.default.scripts]
 build = "hatch build && chmod -R 777 dist/*"
 
 [tool.hatch.envs.test]
-dependencies = ["pytest", "pytest-cov", "coverage[toml]>=6.2"]
+dependencies = ["pytest", "pytest-cov", "coverage[toml]>=6.2", "setuptools==82.0.0"]
 [tool.hatch.envs.test.scripts]
 test = "pytest {args:tests}"
 cov = "pytest --cov=src --cov-report=term-missing --cov-report=xml {args:tests}"
 
 [tool.hatch.envs.lint]
-dependencies = ["ruff>=0.4.0"]
+dependencies = ["ruff>=0.4.0", "setuptools==82.0.0"]
 [tool.hatch.envs.lint.scripts]
 check = "ruff check src tests"
 format = "ruff format src tests"
@@ -80,7 +81,7 @@ fix = "ruff check --fix src tests"
 all = ["format", "fix", "check"]
 
 [tool.hatch.envs.types]
-dependencies = ["mypy>=1.0.0"]
+dependencies = ["mypy>=1.0.0", "setuptools==82.0.0"]
 [tool.hatch.envs.types.scripts]
 check = "mypy --install-types --non-interactive {args:src/shell tests}"
 
@@ -93,6 +94,7 @@ dependencies = [
     "mkdocs-minify-plugin",
     "mkdocs-material-extensions",
     "mkdocs-git-revision-date-localized-plugin",
+    "setuptools==82.0.0",
 ]
 [tool.hatch.envs.docs.scripts]
 build-docs = "mkdocs build"
