@@ -6,7 +6,7 @@ Command-line interface for SHELL.
 
 Provides two subcommands:
 
-* ``shell infer`` — inference on a local RGB .tiff WSI
+* ``shell infer`` — inference on a local RGB whole-slide image
 * ``shell infer-omero`` — inference on an OMERO image (requires ``shell[omero]``)
 """
 
@@ -47,14 +47,14 @@ def build_parser() -> argparse.ArgumentParser:
     # ── infer (local file) ────────────────────────────────────────────
     infer_p = subparsers.add_parser(
         "infer",
-        help="Run inference on a local RGB .tiff whole-slide image.",
+        help="Run inference on a local RGB whole-slide image.",
     )
     infer_p.add_argument(
         "--input",
         "-i",
         type=str,
         required=True,
-        help="Path to the raw RGB .tiff whole-slide image.",
+        help="Path to the raw RGB image (TIFF, PNG, JPEG, etc.).",
     )
     infer_p.add_argument(
         "--output",
@@ -80,6 +80,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Desired output resolution (um/pixel).",
+    )
+    infer_p.add_argument(
+        "--mpp",
+        type=float,
+        default=None,
+        help=(
+            "Source image resolution in um/pixel. Required for formats "
+            "that lack embedded resolution metadata (e.g. PNG, JPEG). "
+            "When omitted the value is read from slide metadata; if "
+            "metadata is unavailable, no resolution scaling is applied."
+        ),
     )
     infer_p.add_argument(
         "--save-eho",
@@ -270,6 +281,7 @@ def main(argv: list[str] | None = None) -> int:
             model_path=args.model_path,
             model_version=args.model_version,
             target_mpp=args.target_mpp,
+            mpp=args.mpp,
             save_eho=args.save_eho,
             stain_downsample=args.stain_downsample,
             device=args.device,
