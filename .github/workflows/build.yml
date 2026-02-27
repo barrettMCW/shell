@@ -18,7 +18,8 @@ jobs:
 
       - name: Install build tools
         run: |
-          python -m pip install --upgrade pip setuptools wheel hatch
+          python -m pip install --upgrade pip setuptools wheel virtualenv
+          python -m pip install --upgrade hatch
 
       - name: Build wheel with hatch
         run: hatch build
