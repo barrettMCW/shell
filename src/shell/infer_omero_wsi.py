@@ -1095,7 +1095,6 @@ def infer_omero_wsi(
     model_path: str | None = None,
     output_path: str,
     target_mpp: float = 1.0,
-    max_dim: int | None = None,
     group_id: int | None = None,
     save_eho: str | None = None,
     no_tissue_crop: bool = False,
@@ -1146,8 +1145,6 @@ def infer_omero_wsi(
         Where to save the prediction image (format from extension).
     target_mpp : float
         Desired microns-per-pixel.
-    max_dim : int or None
-        Clamp the longest output dimension.
     group_id : int or None
         OMERO group to switch to.
     save_eho : str or None
@@ -1266,13 +1263,6 @@ def infer_omero_wsi(
         sy = best_lmpp_y / target_mpp
         out_w = max(1, round(best_lsz_x * sx))
         out_h = max(1, round(best_lsz_y * sy))
-
-        if max_dim is not None and (out_w > max_dim or out_h > max_dim):
-            clamp = min(max_dim / out_w, max_dim / out_h)
-            out_w = max(1, round(out_w * clamp))
-            out_h = max(1, round(out_h * clamp))
-            sx *= clamp
-            sy *= clamp
 
         # Native tile size at best level
         probe2 = conn.c.sf.createRawPixelsStore()  # type: ignore[union-attr]

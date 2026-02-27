@@ -23,9 +23,9 @@ import gc
 import logging
 import os
 import warnings
+from types import ModuleType
 
 import numpy as np
-import openslide
 
 # shell.inference and shell.model load torch at their module level.
 # pyvips must come *after* them so PyTorch initialises its thread-pool
@@ -45,6 +45,9 @@ import pyvips  # isort: skip
 
 log = logging.getLogger(__name__)
 
+_OPENSLIDE_MODULE: ModuleType | None = None
+_OPENSLIDE_IMPORT_FAILED: bool = False
+
 # ---------------------------------------------------------------------------
 # Default parameters
 # ---------------------------------------------------------------------------
@@ -54,12 +57,34 @@ TARGET_MPP: float = 1.0
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _get_openslide() -> ModuleType | None:
+    """Import and cache the ``openslide`` module lazily.
+
+    Returns ``None`` when openslide is unavailable.
+    """
+    global _OPENSLIDE_MODULE, _OPENSLIDE_IMPORT_FAILED
+    if _OPENSLIDE_IMPORT_FAILED:
+        return None
+    if _OPENSLIDE_MODULE is None:
+        try:
+            import openslide
+        except Exception:
+            _OPENSLIDE_IMPORT_FAILED = True
+            return None
+        _OPENSLIDE_MODULE = openslide
+    return _OPENSLIDE_MODULE
+
+
 def _read_mpp_from_openslide(image_path: str) -> tuple[float, float] | None:
     """Try to extract um/px from OpenSlide metadata.
 
     Returns ``(mpp_x, mpp_y)`` or ``None`` if the format is unsupported
     or the metadata is missing.
     """
+    openslide = _get_openslide()
+    if openslide is None:
+        return None
+
     try:
         slide = openslide.OpenSlide(image_path)
     except (
@@ -98,6 +123,15 @@ def _load_image(
         log.info("pyvips could not open %s; falling back to OpenSlide.", image_path)
 
     # --- attempt 2: openslide ---
+    openslide = _get_openslide()
+    if openslide is None:
+        msg = (
+            f"pyvips could not open '{image_path}', and OpenSlide is not available. "
+            "Install openslide-python (and OpenSlide runtime) or use a format "
+            "supported by pyvips."
+        )
+        raise ValueError(msg)
+
     try:
         slide = openslide.OpenSlide(image_path)
         dims = slide.dimensions  # (width, height)
@@ -127,6 +161,47 @@ def _vips_to_rgb_numpy(vips_img: pyvips.Image) -> np.ndarray:
     elif bands != 3:
         vips_img = vips_img.extract_band(0, n=3)
     return vips_img.numpy()
+
+
+def _read_image_size(image_path: str) -> tuple[int, int]:
+    """Return ``(height, width)`` for *image_path*."""
+    try:
+        vips_img = pyvips.Image.new_from_file(image_path, access="sequential")
+        return int(vips_img.height), int(vips_img.width)
+    except pyvips.Error:
+        pass
+
+    openslide = _get_openslide()
+    if openslide is None:
+        msg = f"Could not determine image size for '{image_path}'."
+        raise ValueError(msg)
+
+    try:
+        slide = openslide.OpenSlide(image_path)
+        width, height = slide.dimensions
+        slide.close()
+        return int(height), int(width)
+    except (
+        openslide.OpenSlideUnsupportedFormatError,
+        openslide.OpenSlideError,
+    ) as exc:
+        msg = f"Could not determine image size for '{image_path}'."
+        raise ValueError(msg) from exc
+
+
+def _resize_label_map_nearest(
+    label_map: np.ndarray,
+    out_h: int,
+    out_w: int,
+) -> np.ndarray:
+    """Resize a label map to ``(out_h, out_w)`` using nearest-neighbour."""
+    in_h, in_w = label_map.shape[:2]
+    if in_h == out_h and in_w == out_w:
+        return label_map
+
+    y_idx = np.clip((np.arange(out_h) * in_h / out_h).astype(np.int64), 0, in_h - 1)
+    x_idx = np.clip((np.arange(out_w) * in_w / out_w).astype(np.int64), 0, in_w - 1)
+    return label_map[y_idx[:, None], x_idx[None, :]]
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +311,7 @@ def infer_wsi(
     :param save_eho: optional path to save the intermediate EHO image.
     :param stain_downsample: downsample factor for stain estimation.
     :param device: ``"auto"``, ``"cpu"``, or ``"cuda"``.
-    :return: (H, W) uint8 label map.
+    :return: (H, W) uint8 label map at the original input resolution.
     """
     import torch
 
@@ -266,7 +341,11 @@ def infer_wsi(
     del eho, model
     gc.collect()
 
-    # 3. Save
+    # 3. Always return/save at original input resolution.
+    input_h, input_w = _read_image_size(input_path)
+    label_map = _resize_label_map_nearest(label_map, input_h, input_w)
+
+    # 4. Save
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     pyvips.Image.new_from_array(label_map).write_to_file(output_path)
 

@@ -138,7 +138,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Desired output resolution (um/pixel)",
     )
-    omero_p.add_argument("--max-dim", type=int, default=None)
     omero_p.add_argument(
         "--model-path",
         type=str,
@@ -311,7 +310,6 @@ def main(argv: list[str] | None = None) -> int:
             model_version=args.model_version,
             output_path=args.output,
             target_mpp=args.target_mpp,
-            max_dim=args.max_dim,
             group_id=args.group_id,
             save_eho=args.save_eho,
             no_tissue_crop=args.no_tissue_crop,

@@ -13,7 +13,7 @@ import warnings
 import numpy as np
 import torch
 import torch.nn.functional as F
-from monai.inferers import sliding_window_inference
+from monai.inferers.utils import sliding_window_inference
 from torch.amp import autocast
 
 # ---------------------------------------------------------------------------
@@ -22,7 +22,6 @@ from torch.amp import autocast
 VAL_ROI_SIZE: tuple[int, int] = (512, 512)
 VAL_SW_BATCH: int = 16
 VAL_SW_OVERLAP: float = 0.25
-MAX_DIM: int = 8192
 
 
 def run_inference(
@@ -32,7 +31,6 @@ def run_inference(
     *,
     roi_size: tuple[int, int] = VAL_ROI_SIZE,
     sw_batch_size: int = VAL_SW_BATCH,
-    max_dim: int = MAX_DIM,
     overlap: float = VAL_SW_OVERLAP,
 ) -> np.ndarray:
     """Run sliding-window inference on an EHO (H, W, 3) uint8 image.
@@ -42,24 +40,13 @@ def run_inference(
     :param device: computation device.
     :param roi_size: sliding-window patch size.
     :param sw_batch_size: number of patches per forward pass.
-    :param max_dim: maximum spatial dimension (centre-crop if exceeded).
     :param overlap: fraction of overlap between sliding-window patches.
         Values > 0 enable Gaussian importance weighting so that
         overlapping patch centres contribute more than edges, which
         eliminates the grid artefacts visible with ``mode="constant"``.
     :return: (H, W) uint8 label map.
     """
-    if isinstance(device, str):
-        device = torch.device(device)
-
-    h_orig, w_orig = eho_image.shape[:2]
-    y0, x0 = 0, 0
-
-    h_use, w_use = min(h_orig, max_dim), min(w_orig, max_dim)
-    if h_use < h_orig or w_use < w_orig:
-        y0 = (h_orig - h_use) // 2
-        x0 = (w_orig - w_use) // 2
-        eho_image = eho_image[y0 : y0 + h_use, x0 : x0 + w_use]
+    device_obj = torch.device(device) if isinstance(device, str) else device
 
     # HWC uint8 → NCHW float32 [0, 1]
     img_t = (
@@ -75,7 +62,7 @@ def run_inference(
     if pad_h or pad_w:
         img_t = F.pad(img_t, padding, "constant", 0)
 
-    amp_device = "cuda" if device.type == "cuda" else "cpu"
+    amp_device = "cuda" if device_obj.type == "cuda" else "cpu"
     with (
         torch.inference_mode(),
         autocast(amp_device),
@@ -98,7 +85,7 @@ def run_inference(
             sw_batch_size,
             model,
             overlap=overlap,
-            sw_device=device,
+            sw_device=device_obj,
             device=torch.device("cpu"),
             mode=blend_mode,
         )
@@ -116,11 +103,5 @@ def run_inference(
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-    # Embed back into full canvas if we centre-cropped
-    if h_use < h_orig or w_use < w_orig:
-        full_pred = np.zeros((h_orig, w_orig), dtype=np.uint8)
-        full_pred[y0 : y0 + h_use, x0 : x0 + w_use] = pred
-        return full_pred
 
     return pred
