@@ -12,12 +12,39 @@ Provides two subcommands:
 
 from __future__ import annotations
 
+import os
+
+# Ensure PyTorch initialises its runtime and threads before other native
+# libraries (pyvips, Ice/OMERO) to avoid macOS-level races that can lead
+# to segmentation faults when different C extensions compete for thread
+# runtime ownership.  Set conservative thread counts before importing torch.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
+try:
+    # Import torch early so it initialises its native runtime in the main
+    # thread. This is intentional — we only probe __version__ to force
+    # initialisation without performing heavy work here.
+    import torch  # type: ignore
+
+    _ = torch.__version__  # ensure attribute access triggers initialisation
+    TORCH_AVAILABLE = True
+except Exception:
+    # If torch is unavailable we still continue — the program will emit
+    # a clearer error later when trying to build/load the model.
+    TORCH_AVAILABLE = False
+
 import argparse
 import getpass
 import logging
 import sys
 
 from shell.__about__ import __version__
+
+# Module logger — used for diagnostic messages instead of printing directly.
+log = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -287,35 +314,57 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "infer-omero":
+        # Diagnostic prints added to help narrow where a macOS segfault occurs.
+        # These prints are intentionally lightweight and flushed so they appear
+        # even if the process crashes in a C extension later on.
+        log.debug("DIAG: infer-omero selected")
+        log.debug("DIAG: about to import infer_omero_wsi")
         from shell.infer_omero_wsi import infer_omero_wsi
+
+        log.debug("DIAG: imported infer_omero_wsi")
 
         if args.password is None:
             args.password = getpass.getpass("OMERO password: ")
 
-        print(f"Connecting to {args.host}:{args.port} …")
-        infer_omero_wsi(
-            host=args.host,
-            port=args.port,
-            username=args.username,
-            password=args.password,
-            image_id=args.image_id,
-            model_path=args.model_path,
-            model_version=args.model_version,
-            output_path=args.output,
-            target_mpp=args.target_mpp,
-            group_id=args.group_id,
-            save_eho=args.save_eho,
-            no_tissue_crop=args.no_tissue_crop,
-            device=args.device,
-            inference_tile_size=args.inference_tile_size,
-            tile_overlap=args.tile_overlap,
-            sw_overlap=args.sw_overlap,
-            num_bg_tiles=args.num_bg_tiles,
-            min_thumb_size=args.min_thumb_size,
-            min_tissue_frac=args.min_tissue_frac,
-            prefetch_depth=args.prefetch_depth,
-            num_fetch_workers=args.fetch_workers,
-        )
+        print(f"Connecting to {args.host}:{args.port} …", flush=True)
+        log.debug("DIAG: about to call infer_omero_wsi")
+        try:
+            infer_omero_wsi(
+                host=args.host,
+                port=args.port,
+                username=args.username,
+                password=args.password,
+                image_id=args.image_id,
+                model_path=args.model_path,
+                model_version=args.model_version,
+                output_path=args.output,
+                target_mpp=args.target_mpp,
+                group_id=args.group_id,
+                save_eho=args.save_eho,
+                no_tissue_crop=args.no_tissue_crop,
+                device=args.device,
+                inference_tile_size=args.inference_tile_size,
+                tile_overlap=args.tile_overlap,
+                sw_overlap=args.sw_overlap,
+                num_bg_tiles=args.num_bg_tiles,
+                min_thumb_size=args.min_thumb_size,
+                min_tissue_frac=args.min_tissue_frac,
+                prefetch_depth=args.prefetch_depth,
+                num_fetch_workers=args.fetch_workers,
+            )
+            log.debug("DIAG: infer_omero_wsi returned normally")
+        except BaseException as e:
+            # Catch and print Python-level exceptions; note segfaults (native crashes)
+            # will not be caught here, but these diagnostics will show progress up to
+            # the crash point.
+            import sys
+            import traceback
+
+            log.debug("DIAG: infer_omero_wsi raised an exception:")
+            traceback.print_exc()
+            # Re-raise so existing behaviour (non-zero exit) remains.
+            raise
+        log.debug("DIAG: after infer_omero_wsi (should have saved output)")
         print(f"Saved prediction to {args.output}")
         return 0
 

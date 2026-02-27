@@ -22,15 +22,40 @@ from __future__ import annotations
 
 import logging
 
+import macenko_pca
 import numpy as np
-import pyvips as pv
 from monai.data import MetaTensor
 from monai.transforms import MapTransform, Resize
 from scipy.ndimage import label, uniform_filter
 from scipy.ndimage import sum as ndimage_sum
-from skimage.color import rgb2gray
 
-import macenko_pca
+
+# Lightweight local replacement for skimage.color.rgb2gray to avoid an
+# optional dependency and to keep typing simple. This implements the
+# standard luminance weights and expects input in the [0, 1] float range
+# (matching skimage behavior). It returns a 2D array of floats in [0, 1].
+def rgb2gray(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return image
+    # Expect HWC or CHW: prefer HWC (common in this module)
+    if image.ndim == 3 and image.shape[-1] == 3:
+        # Use common luminance weights
+        weights = np.array([0.2989, 0.5870, 0.1140], dtype=image.dtype)
+        return np.dot(image[..., :3], weights)
+    # Fallback: reduce any trailing channel dimension
+    if image.ndim == 3:
+        return np.mean(image, axis=-1)
+    # Unexpected shape: coerce to 2D via mean
+    return np.mean(image, axis=-1)
+
+
+def _get_pyvips():
+    try:
+        import pyvips as pv
+    except Exception as e:
+        raise RuntimeError("pyvips is required for this operation") from e
+    return pv
+
 
 # ---------------------------------------------------------------------------
 # Resolution-scaling transforms
@@ -40,14 +65,16 @@ import macenko_pca
 class Rescaled(MapTransform):
     """Rescale images from *in_res* to *out_res* microns-per-pixel."""
 
-    def __init__(self, keys, in_res=0.46, out_res=1.37):
+    def __init__(self, keys, in_res=0.46, out_res=2):
         super().__init__(keys)
         self.in_res = in_res
         self.out_res = out_res
 
-    def __call__(self, data, in_res=None, resize_kwargs={}):
+    def __call__(self, data, in_res=None, resize_kwargs=None):
         if in_res is None:
             in_res = self.in_res
+        if resize_kwargs is None:
+            resize_kwargs = {}
         for key in self.keys:
             image = data[key]
             height, width = image.shape[1:]
@@ -55,9 +82,7 @@ class Rescaled(MapTransform):
             new_width = width * in_res // self.out_res
 
             interpolation = (
-                "linear"
-                if len(image.shape) == 3 and image.shape[0] == 3
-                else "nearest"
+                "linear" if len(image.shape) == 3 and image.shape[0] == 3 else "nearest"
             )
 
             if "mode" not in resize_kwargs:
@@ -99,9 +124,8 @@ class LoadImageAtScaled(MapTransform):
         for key in self.key_iterator(d):
             filepath = d[key]
             try:
-                image_pv = pv.Image.new_from_file(
-                    str(filepath), **self.reader_kwargs
-                )
+                pv = _get_pyvips()
+                image_pv = pv.Image.new_from_file(str(filepath), **self.reader_kwargs)
             except Exception as e:
                 raise RuntimeError(
                     f"Failed to load image {filepath} with pyvips: {e}"
@@ -118,9 +142,7 @@ class LoadImageAtScaled(MapTransform):
             ):
                 scale_factor = self.in_res / self.target_res
                 if abs(scale_factor - 1.0) > 1e-6:
-                    image_pv = image_pv.resize(
-                        scale_factor, kernel=self.resize_kernel
-                    )
+                    image_pv = image_pv.resize(scale_factor, kernel=self.resize_kernel)
                     applied_scale_factor = scale_factor
 
             img_array = image_pv.numpy()
@@ -141,9 +163,7 @@ class LoadImageAtScaled(MapTransform):
             if self.target_res is not None:
                 meta_info["target_resolution"] = self.target_res
             if applied_scale_factor != 1.0:
-                meta_info[
-                    "applied_geometric_scale_factor"
-                ] = applied_scale_factor
+                meta_info["applied_geometric_scale_factor"] = applied_scale_factor
 
             d[key] = MetaTensor(img_array, meta=meta_info)
         return d
@@ -172,9 +192,7 @@ class TissueMaskd(MapTransform):
             bg_mask = detect_background(image)
             tissue_mask = ~bg_mask
             meta_info = {"original_channel_dim": "no_channel"}
-            data[f"{key}_tissue_mask"] = MetaTensor(
-                tissue_mask, meta=meta_info
-            )
+            data[f"{key}_tissue_mask"] = MetaTensor(tissue_mask, meta=meta_info)
         return data
 
 
@@ -209,14 +227,21 @@ class MarcenkoDeconvolutiond(MapTransform):
                 tissue_mask = resizer(tissue_mask)
                 tissue_mask = tissue_mask[0]
 
+        # If a tissue_mask was provided as a tensor/MetaTensor, coerce to numpy
+        if tissue_mask is not None:
+            tissue_mask = np.asarray(tissue_mask)
+
         if tissue_mask is None:
             bg_mask = detect_background(image)
             tissue_mask = np.ascontiguousarray(~bg_mask).astype(bool)
 
+        # Ensure tissue_mask is a NumPy boolean array for downstream processing
+        tissue_mask = np.asarray(tissue_mask).astype(bool)
+
         return macenko_pca.rgb_separate_stains_macenko_pca(
             np.ascontiguousarray(image),
             None,
-            mask_out=~tissue_mask.astype(bool),
+            mask_out=~tissue_mask,
         )
 
     def deconv(self, image, tissue_mask=None):
@@ -225,16 +250,12 @@ class MarcenkoDeconvolutiond(MapTransform):
 
         w_est = self.get_w_est(image, tissue_mask=tissue_mask)
 
-        image_her = macenko_pca.color_deconvolution(
-            np.ascontiguousarray(image), w_est
-        )
+        image_her = macenko_pca.color_deconvolution(np.ascontiguousarray(image), w_est)
 
         hematox_index = macenko_pca.find_stain_index(
             self.stain_color_map["hematoxylin"], w_est
         )
-        eosin_index = macenko_pca.find_stain_index(
-            self.stain_color_map["eosin"], w_est
-        )
+        eosin_index = macenko_pca.find_stain_index(self.stain_color_map["eosin"], w_est)
 
         image_her = image_her[..., [hematox_index, eosin_index, 2]]
 
@@ -341,9 +362,7 @@ def detect_background(
     del diff, nz, cmax
 
     gray_q = (
-        0.299 * image_np[..., 0]
-        + 0.587 * image_np[..., 1]
-        + 0.114 * image_np[..., 2]
+        0.299 * image_np[..., 0] + 0.587 * image_np[..., 1] + 0.114 * image_np[..., 2]
     ).astype(np.uint8) >> 4
     entropy_map = np.zeros(gray_q.shape, dtype=np.float32)
     for b in range(16):
@@ -409,25 +428,17 @@ def compute_background_intensity(
 
     if np.sum(bg_for_io) >= 100:
         io_val = float(
-            np.clip(
-                np.mean(image_np[bg_for_io], dtype=np.float64), 200, 255
-            )
+            np.clip(np.mean(image_np[bg_for_io], dtype=np.float64), 200, 255)
         )
     elif np.sum(bg_mask) >= 100:
-        io_val = float(
-            np.clip(
-                np.mean(image_np[bg_mask], dtype=np.float64), 200, 255
-            )
-        )
+        io_val = float(np.clip(np.mean(image_np[bg_mask], dtype=np.float64), 200, 255))
     else:
         io_val = 240.0
     del bg_for_io
     return io_val
 
 
-def estimate_stain_params(
-    rgb: np.ndarray, bg_mask: np.ndarray | None = None
-) -> dict:
+def estimate_stain_params(rgb: np.ndarray, bg_mask: np.ndarray | None = None) -> dict:
     """Estimate Macenko colour-deconvolution parameters from an RGB image."""
     if bg_mask is None:
         bg_mask = detect_background(rgb)
@@ -612,25 +623,16 @@ class EHOd(MapTransform):
             est_image = image
             est_bg = bg_mask
             if image.size > 16777216:  # > 4096^2 pixels
-                logging.info(
-                    "Down-sampling image for stain-parameter estimation"
-                )
+                logging.info("Down-sampling image for stain-parameter estimation")
                 scale = 4
                 h, w = image.shape[:2]
                 small_h, small_w = h // scale, w // scale
-                resizer = Resize(
-                    spatial_size=(small_h, small_w), mode="linear"
-                )
+                resizer = Resize(spatial_size=(small_h, small_w), mode="linear")
                 est_image = (
-                    resizer(image.transpose((2, 0, 1)))
-                    .numpy()
-                    .transpose((1, 2, 0))
+                    resizer(image.transpose((2, 0, 1))).numpy().transpose((1, 2, 0))
                 )
                 if est_bg is not None:
-                    est_bg = (
-                        resizer(est_bg[None].astype(np.float32)).numpy()[0]
-                        > 0.5
-                    )
+                    est_bg = resizer(est_bg[None].astype(np.float32)).numpy()[0] > 0.5
 
             params = estimate_stain_params(
                 np.ascontiguousarray(est_image).astype(np.uint8),

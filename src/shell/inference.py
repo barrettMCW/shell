@@ -21,6 +21,7 @@ in the output, saving downstream processing.
 from __future__ import annotations
 
 import gc
+import os
 import warnings
 
 import numpy as np
@@ -63,9 +64,7 @@ def _build_normalize_pipeline() -> Compose:
                 b_max=1.0,
                 clip=True,
             ),
-            NormalizeIntensityd(
-                keys="image", nonzero=True, channel_wise=True
-            ),
+            NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
             ScaleIntensityd(keys=["image"]),
         ]
     )
@@ -91,7 +90,7 @@ def run_inference(
     device: torch.device | str = "cpu",
     *,
     roi_size: tuple[int, int] = VAL_ROI_SIZE,
-    sw_batch_size: int = VAL_SW_BATCH,
+    sw_batch_size: int | None = None,
     overlap: float = VAL_SW_OVERLAP,
     tissue_mask: np.ndarray | None = None,
 ) -> np.ndarray:
@@ -101,7 +100,7 @@ def run_inference(
     :param model: trained SegResNetVAE in eval mode.
     :param device: computation device.
     :param roi_size: sliding-window patch size.
-    :param sw_batch_size: number of patches per forward pass.
+    :param sw_batch_size: number of patches per forward pass (None => auto).
     :param overlap: fraction of overlap between sliding-window patches.
         Values > 0 enable Gaussian importance weighting so that
         overlapping patch centres contribute more than edges, which
@@ -130,6 +129,53 @@ def run_inference(
     if pad_h or pad_w:
         img_t = F.pad(img_t, padding, "reflect")
 
+    # Heuristic: choose a sliding-window batch size automatically when not provided.
+    def _choose_sw_batch_size(roi: tuple[int, int], device_obj: torch.device) -> int:
+        """Heuristic selection based on ROI area and device capabilities.
+
+        Baseline: VAL_SW_BATCH for 512x512 on a mid-range GPU. Scale batch size
+        inversely with ROI area and up-weight for devices with more memory
+        (e.g. macOS unified memory / MPS).
+        """
+        base_area = 512 * 512
+        roi_area = max(1, roi[0] * roi[1])
+        area_ratio = base_area / roi_area
+
+        # Try to estimate system RAM (in GB) on POSIX systems; conservative fallback.
+        total_ram_gb: float | None = None
+        try:
+            pages = os.sysconf("SC_PHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            total_ram_gb = (pages * page_size) / (1024**3)
+        except Exception:
+            total_ram_gb = None
+
+        # Device factor: raise batch size for GPUs, raise more for large unified RAM (MPS).
+        if device_obj.type == "cuda":
+            device_factor = 2.0
+        elif device_obj.type == "mps":
+            # macOS unified memory benefits from larger batches when system RAM is large.
+            if total_ram_gb is not None:
+                device_factor = max(1.5, min(8.0, total_ram_gb / 8.0))
+            else:
+                device_factor = 3.0
+        else:
+            # CPU: be conservative and scale with available RAM if known.
+            if total_ram_gb is not None:
+                device_factor = max(0.5, min(2.0, total_ram_gb / 32.0))
+            else:
+                device_factor = 0.5
+
+        batch = max(1, int(VAL_SW_BATCH * area_ratio * device_factor))
+        # Clamp to avoid enormous batches on pathological inputs.
+        return min(max(batch, 1), 1024)
+
+    local_sw_batch = (
+        sw_batch_size
+        if sw_batch_size is not None
+        else _choose_sw_batch_size(roi_size, device_obj)
+    )
+
     amp_device = "cuda" if device_obj.type == "cuda" else "cpu"
     with (
         torch.inference_mode(),
@@ -145,17 +191,69 @@ def run_inference(
         logits = sliding_window_inference(
             img_t,
             roi_size,
-            sw_batch_size,
+            local_sw_batch,
             model,
             overlap=overlap,
             sw_device=device_obj,
             device=torch.device("cpu"),
             mode=blend_mode,
         )
+        # MONAI's sliding_window_inference may return a Tensor, a tuple/list
+        # (e.g. when the model returns multiple outputs), or a dict. Normalise
+        # to a single Tensor here so downstream code and the type-checker see
+        # a consistent type.
+        if not isinstance(logits, torch.Tensor):
+            # Tuple / list -> first element is expected to be the logits Tensor.
+            if isinstance(logits, (tuple, list)):
+                if len(logits) > 0 and isinstance(logits[0], torch.Tensor):
+                    logits = logits[0]
+                else:
+                    # Fallback: try to coerce the first element to a tensor.
+                    logits = torch.as_tensor(logits[0])
+            elif isinstance(logits, dict):
+                # Take the first tensor-like value from the dict.
+                found = False
+                for v in logits.values():
+                    if isinstance(v, torch.Tensor):
+                        logits = v
+                        found = True
+                        break
+                if not found:
+                    # Coerce the first value to a tensor as a last resort.
+                    first_val = next(iter(logits.values()))
+                    logits = torch.as_tensor(first_val)
+            else:
+                # If it's some other type, attempt a coercion to Tensor.
+                logits = torch.as_tensor(logits)
     del img_t
 
     # Remove padding
     if pad_h or pad_w:
+        # Ensure we have a Tensor before accessing shape (some MONAI
+        # wrappers may return a tuple/dict). Normalise common container
+        # types to a single Tensor.
+        if not isinstance(logits, torch.Tensor):
+            if (
+                isinstance(logits, (tuple, list))
+                and len(logits) > 0
+                and isinstance(logits[0], torch.Tensor)
+            ):
+                logits = logits[0]
+            elif isinstance(logits, dict):
+                # take first tensor-like value
+                found = False
+                for v in logits.values():
+                    if isinstance(v, torch.Tensor):
+                        logits = v
+                        found = True
+                        break
+                if not found:
+                    # fall back to coercing first value
+                    first_val = next(iter(logits.values()))
+                    logits = torch.as_tensor(first_val)
+            else:
+                logits = torch.as_tensor(logits)
+
         _, _, ph, pw = logits.shape
         logits = logits[
             :, :, padding[2] : ph - padding[3], padding[0] : pw - padding[1]
@@ -164,12 +262,15 @@ def run_inference(
     # ------------------------------------------------------------------
     # Post-processing: sigmoid + threshold + background comparison
     # ------------------------------------------------------------------
+    # Ensure logits is a Tensor before applying sigmoid.
+    if not isinstance(logits, torch.Tensor):
+        logits = torch.as_tensor(logits)
     probs = torch.sigmoid(logits)
     del logits
 
     inner_prob = probs[0, 0]  # channel 0 = epithelium / inner
     outer_prob = probs[0, 1]  # channel 1 = stroma / outer
-    bg_prob = probs[0, 2]     # channel 2 = background
+    bg_prob = probs[0, 2]  # channel 2 = background
     del probs
 
     inner_mask = (inner_prob > 0.5) & (inner_prob > bg_prob)

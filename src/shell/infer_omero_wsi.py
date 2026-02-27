@@ -48,28 +48,66 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Optional OMERO dependency gate
 # ---------------------------------------------------------------------------
-try:
-    from omero.gateway import BlitzGateway as _BlitzGateway
-    from omero.model import enums as omero_enums
+# Lazy OMERO loader: defer importing the heavy omero modules until runtime.
+# This avoids importing OMERO (and its C extensions) at module import time
+# which can race with other libraries (e.g. torch / pyvips) and cause
+# platform-specific crashes.
+_OMERO_BG_CLASS = None
+_OMERO_LOADED = False
+PIXEL_TYPES: dict = {}
 
-    PIXEL_TYPES: dict[str, type] = {
-        omero_enums.PixelsTypeint8: np.int8,
-        omero_enums.PixelsTypeuint8: np.uint8,
-        omero_enums.PixelsTypeint16: np.int16,
-        omero_enums.PixelsTypeuint16: np.uint16,
-        omero_enums.PixelsTypeint32: np.int32,
-        omero_enums.PixelsTypeuint32: np.uint32,
-        omero_enums.PixelsTypefloat: np.float32,
-        omero_enums.PixelsTypedouble: np.float64,
-    }
-    _HAS_OMERO = True
-except ImportError:
-    _HAS_OMERO = False
-    PIXEL_TYPES = {}
+
+def _ensure_omero() -> None:
+    """Attempt to import OMERO & populate `PIXEL_TYPES` / `_OMERO_BG_CLASS`.
+
+    This is idempotent and safe to call from any runtime location. If the
+    import fails the function leaves `_OMERO_LOADED` as False.
+    """
+    global _OMERO_BG_CLASS, PIXEL_TYPES, _OMERO_LOADED
+    if _OMERO_LOADED:
+        return
+    try:
+        import omero  # noqa: F401  (import to ensure runtime available)
+        from omero.gateway import BlitzGateway as _BG
+        from omero.model import enums as omero_enums
+
+        # Map likely enum attribute names to numpy dtypes, but use getattr
+        # so code is robust to differences across OMERO versions.
+        _mapping = {
+            "PixelsTypeint8": np.int8,
+            "PixelsTypeuint8": np.uint8,
+            "PixelsTypeint16": np.int16,
+            "PixelsTypeuint16": np.uint16,
+            "PixelsTypeint32": np.int32,
+            "PixelsTypeuint32": np.uint32,
+            "PixelsTypefloat": np.float32,
+            "PixelsTypedouble": np.float64,
+        }
+
+        pix = {}
+        for name, dtype in _mapping.items():
+            enum_val = getattr(omero_enums, name, None)
+            if enum_val is not None:
+                pix[enum_val] = dtype
+
+        PIXEL_TYPES.clear()
+        PIXEL_TYPES.update(pix)
+
+        _OMERO_BG_CLASS = _BG
+        _OMERO_LOADED = True
+    except Exception:
+        # Leave PIXEL_TYPES empty and _OMERO_LOADED False on failure.
+        PIXEL_TYPES.clear()
+        _OMERO_BG_CLASS = None
+        _OMERO_LOADED = False
 
 
 def _require_omero() -> None:
-    if not _HAS_OMERO:
+    # Ensure the OMERO runtime is available at call time. This calls the
+    # lazy loader which attempts to import OMERO and populate the runtime
+    # objects. If import fails we raise the usual ImportError.
+    _ensure_omero()
+    if not _OMERO_LOADED:
         msg = (
             "The 'omero' optional dependency is required for OMERO support. "
             "Install it with: pip install shell[omero]"
@@ -142,9 +180,24 @@ def create_omero_connection(
         A connected gateway instance.
     """
     _require_omero()
-    from omero.gateway import BlitzGateway as _BG
+    # Use the lazily-loaded BlitzGateway class populated by _ensure_omero().
+    _BG = _OMERO_BG_CLASS
+    if _BG is None:
+        # Defensive: if the class is not available treat as missing dependency.
+        raise ImportError(
+            "OMERO BlitzGateway class not available; ensure OMERO is installed"
+        )
 
     parsed = urlparse(host)
+
+    # Diagnostic print to help trace macOS crashes during connection setup.
+    try:
+        logger.debug(
+            f"DIAG: create_omero_connection start host={host!r} port={port} scheme={parsed.scheme!r}"
+        )
+    except Exception:
+        # Best-effort diagnostic; do not stop the connection logic if logging fails.
+        pass
 
     if parsed.scheme in ("wss", "ws"):
         import omero  # type: ignore[import-untyped]
@@ -166,9 +219,20 @@ def create_omero_connection(
             ws_path,
         )
 
+        try:
+            logger.debug(
+                f"DIAG: creating omero.client with router={router!r} (proto={proto})"
+            )
+        except Exception:
+            pass
+
         client = omero.client(args=["--Ice.Default.Router=" + router])
         try:
             client.createSession(username, password)
+            try:
+                logger.debug("DIAG: omero.client.createSession succeeded")
+            except Exception:
+                pass
         except Exception as exc:
             msg = (
                 f"Failed to create OMERO session via "
@@ -177,17 +241,50 @@ def create_omero_connection(
             raise RuntimeError(msg) from exc
 
         conn = _BG(client_obj=client)
-        if not conn.connect():
+        # If we created a raw omero.client earlier (websocket path) attach it
+        # to the BlitzGateway instance so it can be closed explicitly later.
+        try:
+            setattr(conn, "_omero_ws_client", client)
+        except Exception:
+            pass
+        try:
+            connected = conn.connect()
+            try:
+                logger.debug(f"DIAG: BlitzGateway.connect() returned {connected!r}")
+            except Exception:
+                pass
+        except Exception as exc:
+            # Surface the connect() error with a diagnostic print before raising.
+            try:
+                logger.debug(f"DIAG: BlitzGateway.connect() raised: {exc}")
+            except Exception:
+                pass
+            raise
+
+        if not connected:
             msg = (
                 f"BlitzGateway.connect() failed after session creation "
                 f"({proto}://{ws_host}:{ws_port}{ws_path})"
             )
             raise RuntimeError(msg)
+        try:
+            logger.debug(
+                "DIAG: create_omero_connection returning connected WS BlitzGateway"
+            )
+        except Exception:
+            pass
         return conn
 
     # Standard Ice connection
     clean_host = parsed.hostname or host
     actual_port = parsed.port or port
+
+    try:
+        logger.debug(
+            f"DIAG: creating standard BlitzGateway to {clean_host}:{actual_port} secure={secure}"
+        )
+    except Exception:
+        pass
 
     conn = _BG(
         username,
@@ -196,10 +293,73 @@ def create_omero_connection(
         port=actual_port,
         secure=secure,
     )
-    if not conn.connect():
+    try:
+        connected = conn.connect()
+        try:
+            logger.debug(f"DIAG: BlitzGateway.connect() returned {connected!r}")
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            logger.debug(f"DIAG: BlitzGateway.connect() raised: {exc}")
+        except Exception:
+            pass
+        raise
+
+    if not connected:
         msg = f"Failed to connect to OMERO at {clean_host}:{actual_port}"
         raise RuntimeError(msg)
+
+    try:
+        logger.debug("DIAG: create_omero_connection returning connected BlitzGateway")
+    except Exception:
+        pass
     return conn
+
+
+def _safe_close_blitzgateway(conn: Any) -> None:
+    """Best-effort close of a BlitzGateway and any attached raw omero.client.
+
+    Different OMERO transports / versions expose slightly different cleanup
+    APIs.  Try several likely methods without raising to ensure Ice
+    communicators are destroyed where possible.
+    """
+    try:
+        # Preferred: BlitzGateway.close()
+        if hasattr(conn, "close"):
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        # Some versions expose disconnect()
+        if hasattr(conn, "disconnect"):
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        # If we attached a raw omero.client during creation, try to close/destroy it.
+        client_obj = getattr(conn, "_omero_ws_client", None)
+        if client_obj is not None:
+            if hasattr(client_obj, "close"):
+                try:
+                    client_obj.close()
+                except Exception:
+                    pass
+            if hasattr(client_obj, "destroy"):
+                try:
+                    client_obj.destroy()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +782,7 @@ def _fetch_thumbnail_rgb(
 
 def _build_tissue_mask(thumb_rgb: np.ndarray) -> np.ndarray:
     """Return a boolean tissue mask (``True`` = tissue) from a thumbnail."""
-    from shell.preprocessing import detect_background
+    from shell.transforms import detect_background
 
     bg_mask = detect_background(thumb_rgb)
     return ~bg_mask
@@ -856,10 +1016,7 @@ def _precompute_tile_info(
 
 def _fetch_worker(
     worker_id: int,
-    host: str,
-    port: int,
-    username: str,
-    password: str,
+    conn: "BlitzGateway",
     work_queue: queue.Queue[Any],
     result_queue: queue.Queue[Any],
     stop_event: threading.Event,
@@ -875,7 +1032,13 @@ def _fetch_worker(
     sy: float,
     stain_params: dict[str, Any],
 ) -> None:
-    """Single fetch worker — owns its own OMERO connection.
+    """Single fetch worker — uses a BlitzGateway connection provided by the
+    main thread.
+
+    The main thread is responsible for creating the OMERO connections and
+    passing a connection object to each worker. Workers must NOT close the
+    shared connection; the coordinator will close connections after workers
+    exit.
 
     Pulls tile descriptors from *work_queue*, fetches pixel data from
     OMERO (using the bulk-fetch fast-path when possible), applies EHO
@@ -884,12 +1047,12 @@ def _fetch_worker(
     The bounded *result_queue* provides back-pressure: if inference falls
     behind, workers block on ``put`` until space is available.
     """
-    from shell.preprocessing import apply_eho_chunked
+    from shell.transforms import apply_eho_chunked
 
-    conn = None
+    # Connection is provided by the caller (created in the main/coordinator
+    # thread). Worker owns a RawPixelsStore instance derived from it.
     store = None
     try:
-        conn = create_omero_connection(host, port, username, password)
         store = conn.c.sf.createRawPixelsStore()
         store.setPixelsId(pixels_id, False)
         store.setResolutionLevel(best_level)
@@ -952,16 +1115,14 @@ def _fetch_worker(
         logger.exception("Fetch worker %d encountered an error", worker_id)
         result_queue.put(exc)
     finally:
+        # Close only the RawPixelsStore opened by this worker.
         if store is not None:
             try:
                 store.close()
             except Exception:
                 pass
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+        # Do NOT close the BlitzGateway connection here; the coordinator
+        # (creator) is responsible for closing it.
 
 
 def _parallel_fetch_coordinator(
@@ -986,10 +1147,10 @@ def _parallel_fetch_coordinator(
 ) -> None:
     """Start *num_workers* fetch threads, each with its own OMERO session.
 
-    All tile descriptors are placed on a shared work queue.  Workers pull
-    tiles, fetch pixels, apply EHO, and place results on *result_queue*.
-    When the work queue is exhausted a ``_SENTINEL`` is placed on
-    *result_queue* so the consumer knows all tiles have been produced.
+    The coordinator now creates the BlitzGateway connections in the main
+    coordinator thread and passes a dedicated connection to each worker.
+    This avoids importing / initialising the OMERO native runtime inside
+    worker threads (which can trigger macOS-level races and segfaults).
     """
     work_queue: queue.Queue[Any] = queue.Queue()
     stop_event = threading.Event()
@@ -1006,16 +1167,31 @@ def _parallel_fetch_coordinator(
         n_tiles,
     )
 
+    # Pre-create one BlitzGateway connection per worker in this (main)
+    # coordinator thread to avoid initialising OMERO / Ice inside workers.
+    conns: list[Any] = []
+    for i in range(num_workers):
+        try:
+            conn = create_omero_connection(host, port, username, password)
+            conns.append(conn)
+            logger.debug("Created OMERO connection for worker %d", i)
+        except Exception as exc:
+            # Clean up any already-created connections and re-raise.
+            for c in conns:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            logger.exception("Failed to create OMERO connection for worker %d", i)
+            raise
+
     workers: list[threading.Thread] = []
     for i in range(num_workers):
         t = threading.Thread(
             target=_fetch_worker,
             kwargs={
                 "worker_id": i,
-                "host": host,
-                "port": port,
-                "username": username,
-                "password": password,
+                "conn": conns[i],
                 "work_queue": work_queue,
                 "result_queue": result_queue,
                 "stop_event": stop_event,
@@ -1042,6 +1218,14 @@ def _parallel_fetch_coordinator(
 
     result_queue.put(_SENTINEL)
     logger.info("All fetch workers finished.")
+
+    # Close all pre-created BlitzGateway connections used by the workers.
+    # Use the best-effort helper to avoid leaving Ice communicators open.
+    for c in conns:
+        try:
+            _safe_close_blitzgateway(c)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1186,8 +1370,19 @@ def infer_omero_wsi(
     np.ndarray
         ``(H, W)`` uint8 label map.
     """
-    _require_omero()
+    try:
+        logger.debug(
+            f"DIAG: infer_omero_wsi start host={host!r} port={port} image_id={image_id} "
+            f"inference_tile_size={inference_tile_size} num_fetch_workers={num_fetch_workers}"
+        )
+    except Exception:
+        pass
 
+    _require_omero()
+    try:
+        logger.debug("DIAG: _require_omero() returned")
+    except Exception:
+        pass
     # Sanity-check: overlap must leave room for a meaningful core.
     if tile_overlap < 0:
         tile_overlap = 0
@@ -1199,6 +1394,36 @@ def infer_omero_wsi(
             inference_tile_size // 4,
         )
         tile_overlap = inference_tile_size // 4
+
+    # Ensure PyTorch and the model are initialised in the main thread BEFORE
+    # creating OMERO connections / starting any worker threads. This avoids
+    # macOS-level races between native runtimes (torch / libvips / Ice).
+    try:
+        import torch  # type: ignore
+
+        from shell.model import build_model
+    except Exception:
+        # If torch or model scaffolding is not available we'll let the
+        # existing _require_omero() / create_omero_connection surface an
+        # appropriate error later. Continue to attempt OMERO connection.
+        torch = None  # type: ignore
+        build_model = None  # type: ignore
+
+    if build_model is not None:
+        if device == "auto":
+            try:
+                if torch is not None and torch.cuda.is_available():
+                    device = "cuda"
+                elif torch is not None and torch.backends.mps.is_available():
+                    device = "mps"
+                else:
+                    device = "cpu"
+            except Exception:
+                device = "cpu"
+        logger.info("Loading model (device=%s) …", device)
+        model = build_model(model_path, device, model_version=model_version)
+    else:
+        model = None  # type: ignore
 
     conn = create_omero_connection(host, port, username, password)
 
@@ -1316,7 +1541,7 @@ def infer_omero_wsi(
         # ------------------------------------------------------------------
         # 3. Fetch a few background tiles at full resolution for Io
         # ------------------------------------------------------------------
-        from shell.preprocessing import compute_background_intensity
+        from shell.transforms import compute_background_intensity
 
         bg_tile_coords = _pick_background_tile_coords(
             tissue_mask,
@@ -1459,8 +1684,7 @@ def infer_omero_wsi(
             out_h=out_h,
             out_w=out_w,
             prefetch_depth=prefetch_depth,
-            model_path=model_path,
-            model_version=model_version,
+            model=model,
             device=device,
             save_eho=save_eho,
             output_path=output_path,
@@ -1471,7 +1695,7 @@ def infer_omero_wsi(
 
     except Exception:
         try:
-            conn.close()
+            _safe_close_blitzgateway(conn)
         except Exception:
             pass
         raise
@@ -1507,8 +1731,7 @@ def _run_pipeline(
     out_h: int,
     out_w: int,
     prefetch_depth: int,
-    model_path: str | None,
-    model_version: str | None,
+    model: Any,
     device: str,
     save_eho: str | None,
     output_path: str,
@@ -1566,26 +1789,34 @@ def _run_pipeline(
         name="omero-fetch-coordinator",
         daemon=True,
     )
-    fetch_thread.start()
-
     try:
-        # torch is imported ONLY here, in the main thread.  The fetch
-        # thread never touches torch.
-        import torch
+        # torch is imported here for device checks used by run_inference.
+        # The model itself is provided by the caller (loaded earlier in the
+        # main infer_omero_wsi function) and must be passed via the `model`
+        # parameter. Starting the fetch thread now is safe because the model
+        # has already been initialised on the main thread.
+        import torch  # type: ignore
 
         from shell.inference import run_inference
-        from shell.model import build_model
 
         if device == "auto":
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif torch.backends.mps.is_available():
-                device = "mps"
-            else:
+            try:
+                if torch.cuda.is_available():
+                    device = "cuda"
+                elif torch.backends.mps.is_available():
+                    device = "mps"
+                else:
+                    device = "cpu"
+            except Exception:
                 device = "cpu"
 
-        logger.info("Loading model (device=%s) …", device)
-        model = build_model(model_path, device, model_version=model_version)
+        # Start the fetch thread immediately; the heavy model runtime was
+        # already initialised by the caller before calling _run_pipeline.
+        try:
+            fetch_thread.start()
+            logger.info("Started OMERO fetch thread.")
+        except Exception:
+            logger.exception("Failed to start OMERO fetch thread; continuing.")
 
         pred = np.zeros((out_h, out_w), dtype=np.uint8)
 
@@ -1649,6 +1880,6 @@ def _run_pipeline(
         if fetch_thread.is_alive():
             logger.warning("Fetch thread did not exit within 30 s; continuing cleanup.")
         try:
-            conn.close()
+            _safe_close_blitzgateway(conn)
         except Exception:
             pass

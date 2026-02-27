@@ -24,6 +24,7 @@ import logging
 import os
 import warnings
 from types import ModuleType
+from typing import cast
 
 import numpy as np
 
@@ -147,8 +148,18 @@ def _load_image(
         raise ValueError(msg) from exc
 
 
-def _vips_to_rgb_numpy(vips_img: pyvips.Image) -> np.ndarray:
-    """Convert a pyvips image to (H, W, 3) uint8 RGB numpy array."""
+def _vips_to_rgb_numpy(vips_img: pyvips.Image | np.ndarray) -> np.ndarray:
+    """Convert a pyvips image or numpy array to (H, W, 3) uint8 RGB numpy array."""
+    # If the caller accidentally passes a numpy array (e.g. from an openslide
+    # fallback), accept it and normalise to (H, W, 3) uint8.
+    if isinstance(vips_img, np.ndarray):
+        arr = vips_img
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        elif arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[..., :3]
+        return arr.astype(np.uint8)
+
     bands = vips_img.bands
     if bands == 1:
         vips_img = vips_img.bandjoin([vips_img, vips_img])
@@ -251,11 +262,11 @@ def preprocess_wsi(
     needs_scaling = not (abs(scale_x - 1.0) < 1e-6 and abs(scale_y - 1.0) < 1e-6)
 
     if source == "vips":
-        vips_img = img_or_vips
+        vips_img = cast(pyvips.Image, img_or_vips)
         if needs_scaling:
-            vips_img = vips_img.resize(
-                1.0 / scale_x, vscale=1.0 / scale_y, kernel="lanczos3"
-            )
+            # Use positional vscale/kernel to satisfy the pyvips stubs and
+            # avoid type-checker complaints about keyword-only overloads.
+            vips_img = vips_img.resize(1.0 / scale_x, 1.0 / scale_y, "lanczos3")
         image_np = _vips_to_rgb_numpy(vips_img)
         del vips_img
     else:
@@ -263,8 +274,10 @@ def preprocess_wsi(
         image_np = img_or_vips
         if needs_scaling:
             vips_tmp = pyvips.Image.new_from_array(image_np)
-            vips_tmp = vips_tmp.resize(
-                1.0 / scale_x, vscale=1.0 / scale_y, kernel="lanczos3"
+            # cast to Image for the type-checker and use positional args for
+            # the same reason as above.
+            vips_tmp = cast(pyvips.Image, vips_tmp).resize(
+                1.0 / scale_x, 1.0 / scale_y, "lanczos3"
             )
             image_np = _vips_to_rgb_numpy(vips_tmp)
             del vips_tmp
