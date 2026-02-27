@@ -99,12 +99,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional: also save the intermediate EHO image.",
     )
     infer_p.add_argument(
-        "--stain-downsample",
-        type=int,
-        default=4,
-        help="Downsample factor for stain parameter estimation.",
-    )
-    infer_p.add_argument(
         "--device",
         type=str,
         default="auto",
@@ -282,7 +276,6 @@ def main(argv: list[str] | None = None) -> int:
             target_mpp=args.target_mpp,
             mpp=args.mpp,
             save_eho=args.save_eho,
-            stain_downsample=args.stain_downsample,
             device=args.device,
         )
 

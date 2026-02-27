@@ -33,6 +33,7 @@ dependencies = [
     "pyvips",
     "openslide-python",
     "macenko-pca",
+    "scikit-image",
 ]
 
 [project.optional-dependencies]
@@ -67,7 +68,12 @@ dependencies = ["setuptools==82.0.0"]
 build = "hatch build && chmod -R 777 dist/*"
 
 [tool.hatch.envs.test]
-dependencies = ["pytest", "pytest-cov", "coverage[toml]>=6.2", "setuptools==82.0.0"]
+dependencies = [
+    "pytest",
+    "pytest-cov",
+    "coverage[toml]>=6.2",
+    "setuptools==82.0.0",
+]
 [tool.hatch.envs.test.scripts]
 test = "pytest {args:tests}"
 cov = "pytest --cov=src --cov-report=term-missing --cov-report=xml {args:tests}"

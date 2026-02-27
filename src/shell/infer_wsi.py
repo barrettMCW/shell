@@ -34,11 +34,7 @@ import numpy as np
 # own the same OpenMP/GCD thread infrastructure.
 from shell.inference import run_inference
 from shell.model import build_model
-from shell.preprocessing import (
-    apply_eho_chunked,
-    detect_background,
-    estimate_stain_params,
-)
+from shell.transforms import EHOd, TissueMaskd
 
 # pyvips intentionally after torch-loading shell imports above (macOS safety)
 import pyvips  # isort: skip
@@ -212,9 +208,11 @@ def preprocess_wsi(
     *,
     target_mpp: float = TARGET_MPP,
     mpp: float | None = None,
-    stain_downsample: int = 4,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Read a raw RGB image, scale to *target_mpp*, and produce an EHO image.
+
+    Uses the MONAI transform pipeline (``TissueMaskd`` → ``EHOd``) from
+    :mod:`shell.transforms`.
 
     :param image_path: path to an RGB image (TIFF, PNG, JPEG, etc.).
     :param target_mpp: desired microns-per-pixel.
@@ -222,9 +220,11 @@ def preprocess_wsi(
         ``None`` the value is read from slide metadata; if metadata is
         unavailable (e.g. plain PNG) a warning is emitted and scaling is
         skipped (the image is assumed to already be at *target_mpp*).
-    :param stain_downsample: downsample factor for stain parameter estimation.
     :return: tuple of (H, W, 3) uint8 EHO image and (H, W) bool tissue mask.
     """
+    from monai.data import MetaTensor
+    from monai.transforms import Compose
+
     # 1. Determine MPP
     if mpp is not None:
         mpp_x = mpp_y = float(mpp)
@@ -269,23 +269,24 @@ def preprocess_wsi(
             image_np = _vips_to_rgb_numpy(vips_tmp)
             del vips_tmp
 
-    # 4. Estimate stain parameters on a down-sampled copy
-    ds = stain_downsample
-    rgb_small = image_np[::ds, ::ds]
-    bg_small = detect_background(rgb_small)
-    sp = estimate_stain_params(rgb_small, bg_mask=bg_small)
-    del rgb_small, bg_small
+    # 4. Run MONAI transform pipeline: TissueMask → EHO
+    pipeline = Compose(
+        [
+            TissueMaskd(keys=["image"]),
+            EHOd(
+                keys=["image"],
+                tissue_mask_keys=["image_tissue_mask"],
+            ),
+        ]
+    )
+    data = pipeline({"image": MetaTensor(image_np)})
+    del image_np
     gc.collect()
 
-    # 4b. Build tissue mask from the background mask at full resolution
-    bg_full = detect_background(image_np)
-    tissue_mask = ~bg_full
-    del bg_full
-
-    # 5. Apply EHO colour transform (chunked)
-    eho = apply_eho_chunked(image_np, **sp)
-    del image_np, sp
-    gc.collect()
+    # EHOd outputs (3, H, W) MetaTensor — convert back to (H, W, 3) uint8
+    eho = data["image"].numpy().transpose(1, 2, 0).astype(np.uint8)
+    tissue_mask = data["image_tissue_mask"].numpy().squeeze() > 0
+    del data
 
     return eho, tissue_mask
 
@@ -299,7 +300,6 @@ def infer_wsi(
     target_mpp: float = TARGET_MPP,
     mpp: float | None = None,
     save_eho: str | None = None,
-    stain_downsample: int = 4,
     device: str = "auto",
 ) -> np.ndarray:
     """Full pipeline: preprocess -> model -> label image.
@@ -314,7 +314,6 @@ def infer_wsi(
     :param mpp: manual source um/px override.  See
         :func:`preprocess_wsi` for details.
     :param save_eho: optional path to save the intermediate EHO image.
-    :param stain_downsample: downsample factor for stain estimation.
     :param device: ``"auto"``, ``"cpu"``, or ``"cuda"``.
     :return: (H, W) uint8 label map at the original input resolution.
     """
@@ -333,7 +332,6 @@ def infer_wsi(
         input_path,
         target_mpp=target_mpp,
         mpp=mpp,
-        stain_downsample=stain_downsample,
     )
 
     if save_eho:
