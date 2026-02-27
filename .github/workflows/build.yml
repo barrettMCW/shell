@@ -11,10 +11,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build Docker image
-        run: docker build --target hatch -t shell:hatch .
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install virtualenv==20.17.1
+          python -m pip install hatch hatch-uv
+
       - name: Build wheel with hatch
-        run: docker run --rm --entrypoint hatch -v "${{ github.workspace }}:/app" shell:hatch build
+        run: |
+          python -m pip install --upgrade build
+          hatch build
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:

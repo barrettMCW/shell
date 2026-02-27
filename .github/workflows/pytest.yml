@@ -10,11 +10,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Docker image
-        run: docker build --target hatch -t shell:hatch .
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest pytest-cov coverage[toml]>=6.2
 
       - name: Run pytest and generate coverage report
-        run: docker run --rm -e HATCH_ENV=test -v "${{ github.workspace }}:/app" shell:hatch cov
+        run: |
+          pytest --cov=src --cov-report=xml:coverage.xml
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
